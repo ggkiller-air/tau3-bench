@@ -184,12 +184,15 @@ def get_tasks_split() -> dict[str, list[str]]:
     return load_tasks_split(TELECOM_TASK_SET_PATH)
 
 
-# Legacy functions for backward compatibility
-def get_tasks_full() -> list[Task]:
+# Legacy functions for backward compatibility.
+# The registry's task loader may call these as func(task_split_name=...), so they
+# must accept (and ignore) that kwarg — otherwise --task-set-name telecom_small /
+# telecom_full crashes with an unexpected-keyword TypeError.
+def get_tasks_full(task_split_name: Optional[str] = None) -> list[Task]:
     return get_tasks("full")
 
 
-def get_tasks_small() -> list[Task]:
+def get_tasks_small(task_split_name: Optional[str] = None) -> list[Task]:
     return get_tasks("small")
 
 

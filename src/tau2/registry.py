@@ -14,6 +14,7 @@ from tau2.agent.llm_agent import (
     create_llm_gt_agent,
     create_llm_solo_agent,
 )
+from tau2.agent.schema_agent import create_schema_solo_agent
 from tau2.data_model.tasks import Task
 from tau2.domains.airline.environment import (
     get_environment as airline_domain_get_environment,
@@ -303,6 +304,12 @@ try:
     registry.register_agent_factory(
         create_llm_solo_agent,
         "llm_agent_solo",
+        task_filter=LLMSoloAgent.check_valid_task,
+        metadata={"solo_mode": True},
+    )
+    registry.register_agent_factory(
+        create_schema_solo_agent,
+        "schema_solo_agent",
         task_filter=LLMSoloAgent.check_valid_task,
         metadata={"solo_mode": True},
     )

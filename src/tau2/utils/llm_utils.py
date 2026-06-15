@@ -17,6 +17,28 @@ from litellm.caching.caching import Cache
 from litellm.main import ModelResponse, Usage
 from loguru import logger
 
+# Local/self-hosted models (e.g. vLLM) are not in litellm's price table, so
+# completion_cost() logs a noisy "This model isn't mapped yet" ERROR on every
+# call. Register them with zero cost to silence it. Purely cosmetic — does not
+# affect runs (reported cost is just $0). Add other local served-names here.
+# Placeholder pricing for the local SLM — set to DeepSeek-style cheap rates
+# ($/token): in $0.27/M, out $1.10/M, cached-input $0.07/M. These feed litellm's
+# cost calc (and our report's $ metric reads the same numbers). Adjust freely.
+for _local_model in ("qwen3-8b", "qwen3-4b-instruct-2507", "qwen3-4b"):
+    try:
+        litellm.register_model(
+            {
+                _local_model: {
+                    "input_cost_per_token": 0.27e-6,
+                    "output_cost_per_token": 1.10e-6,
+                    "cache_read_input_token_cost": 0.07e-6,
+                    "litellm_provider": "openai",
+                }
+            }
+        )
+    except Exception:  # never let a cosmetic registration break startup
+        pass
+
 from tau2.config import (
     DEFAULT_LLM_CACHE_TYPE,
     DEFAULT_MAX_RETRIES,

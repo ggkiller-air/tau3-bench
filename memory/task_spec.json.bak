@@ -1,0 +1,745 @@
+{
+  "__comment__": "tau2/telecom task-family specs (ESSA-style, ADAPTED for tool-calling over a diagnostic decision-tree). Scope: the 3 families exercised by data/tau2/domains/telecom/tasks_small.json (20 tasks). Golden traces follow data/tau2/domains/telecom/tech_support_workflow_solo.md. Families: 'mobile_data' (Path 2 = 2.1 Unavailable + 2.2 Slow, 8 tasks), 'no_service' (Path 1 No Service/Connection, 6 tasks), 'mms' (Path 3 Picture/Group Messaging, 6 tasks). The task-id prefix maps to a family via schema_agent._FAMILY_BY_PREFIX: mobile_data_issue->mobile_data, service_issue->no_service, mms_issue->mms.",
+  "__design_notes__": {
+    "deviation_from_alfworld_essa": "alfworld task_specs use a STATIC linear base_subtask_sequence. telecom is a branching DIAGNOSTIC TREE, so we keep a single ordered subtask list but gate every subtask with a `when` predicate over task_state. Diagnostic subtasks fill task_state; fix subtasks fire only when their branch condition holds; once task_state.resolved becomes true every later `when` is false and the walk short-circuits. The walk is guarded+sticky (a subtask stays active until its done_when_all holds) and the executor is restricted to the active subtask's tools. This encodes the tree WITHOUT a big-model scheduler (the deferred DyLight piece).",
+    "no_pddl_world_model": "tool returns are already structured, so the StateUpdater writes parsed values DIRECTLY into the shared task_state fields. No separate world model.",
+    "routing_field_data_available": "Path 2 splits on whether mobile data is up at all. The StateUpdater sets a derived boolean `data_available` next to `speed_test`: 'no connection' -> data_available=false (run Path 2.1 fixes); any real speed -> data_available=true (data is up; if not 'excellent', run Path 2.2 slow-data fixes). 'excellent' also sets resolved=true. This keeps every branch guard a simple `== ` / `!=` atom (the DSL has no NOT/IN).",
+    "solo_note": "Run in solo mode: the agent issues every call as requestor=assistant; the env routes device tools (run_speed_test, check_network_status, toggle_*, reboot_device, make_payment, can_send_mms, grant_app_permission, ...) to the user toolkit automatically. reward_basis is ENV_ASSERTION for most tasks (judged on final device/account state) and ENV_ASSERTION+ACTION for the two escalation tasks (lock_sim_card_pin, contract_end_suspension) where the required action is transfer_to_human_agents.",
+    "current_date": "Per main_policy_solo.md the current time is 2025-02-25 12:08 EST; used by CHECK_SUSPENSION to decide if a line's contract_end_date is in the past."
+  },
+  "mobile_data": {
+    "goal_template": "restore mobile data for <customer_name> (<phone_number>) until speed excellent",
+    "success_when_all": [
+      "task_state.speed_test == 'excellent'"
+    ],
+    "task_state_schema": {
+      "fields": {
+        "goal": "string",
+        "customer_name": "string (from ticket)",
+        "phone_number": "string (from ticket)",
+        "customer_id": "string|null (IDENTIFY_CUSTOMER)",
+        "candidate_line_ids": "list|null (customer line_ids; RESOLVE_LINE walks it)",
+        "line_id": "string|null (line whose phone == phone_number; RESOLVE_LINE)",
+        "is_abroad": "bool|null (true only if ticket says abroad/traveling)",
+        "pay_allowed": "bool|null (ticket authorizes paying overdue bills)",
+        "refuel_allowed": "bool|null (ticket authorizes a data refuel)",
+        "refuel_gb": "number|null (GB authorized to refuel)",
+        "service_status": "string|null ('connected'/'no_service'/'searching')",
+        "airplane_mode": "bool|null",
+        "sim_status": "string|null (active/missing/locked_pin/locked_puk)",
+        "apn_broken": "bool|null",
+        "line_suspended": "bool|null",
+        "contract_ended": "bool|null",
+        "overdue_bill_id": "string|null",
+        "payment_requested": "bool|null",
+        "bill_paid": "bool|null",
+        "speed_test": "string|null",
+        "data_available": "bool|null (false iff 'no connection')",
+        "roaming_enabled_device": "bool|null",
+        "mobile_data_enabled": "bool|null",
+        "line_roaming_enabled": "bool|null",
+        "data_usage_exceeded": "bool|null",
+        "data_saver_on": "bool|null",
+        "network_mode": "string|null",
+        "vpn_active": "bool|null",
+        "can_send_mms": "bool|null",
+        "wifi_calling_on": "bool|null",
+        "mms_storage_perm": "bool|null",
+        "mms_sms_perm": "bool|null",
+        "mmsc_url_present": "bool|null",
+        "apn_rebooted": "bool|null",
+        "escalated": "bool|null (set once an ESCALATE transfers; halts downstream)",
+        "resolved": "bool (family goal met; ONLY terminal VERIFY_* / family-exclusive fixes set it)"
+      }
+    },
+    "init_rules": [
+      "customer_name, phone_number: extract verbatim from the ticket.",
+      "is_abroad: true ONLY if the ticket explicitly says the user is abroad/traveling; if it says at home, false; else null.",
+      "pay_allowed: true if the ticket says the user authorized paying their overdue bill(s); else null.",
+      "refuel_allowed / refuel_gb: 'will refuel 2.0 GB if necessary' -> refuel_allowed=true, refuel_gb=2.0; else null.",
+      "ALL diagnostic/phase fields start null and are filled ONLY by their subtask from real tool output. Never fabricate from the ticket.",
+      "resolved := false; escalated := false."
+    ],
+    "base_subtask_sequence": [
+      {
+        "name": "identifyCustomer",
+        "subtask_type": "IDENTIFY_CUSTOMER",
+        "when": "task_state.customer_id == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "resolveLine",
+        "subtask_type": "RESOLVE_LINE",
+        "when": "task_state.customer_id != null and task_state.line_id == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkService",
+        "subtask_type": "CHECK_SERVICE",
+        "when": "task_state.resolved == false and task_state.service_status == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixAirplane",
+        "subtask_type": "FIX_AIRPLANE",
+        "when": "task_state.resolved == false and task_state.airplane_mode == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixSim",
+        "subtask_type": "FIX_SIM",
+        "when": "task_state.resolved == false and task_state.sim_status == 'missing'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "escalateSim",
+        "subtask_type": "ESCALATE",
+        "when": "task_state.resolved == false and task_state.escalated != true and task_state.sim_status == 'locked_pin' or task_state.resolved == false and task_state.escalated != true and task_state.sim_status == 'locked_puk'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkApn",
+        "subtask_type": "CHECK_APN",
+        "when": "task_state.resolved == false and task_state.service_status != 'connected' and task_state.service_status != null and task_state.sim_status == 'active' and task_state.apn_broken == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixApn",
+        "subtask_type": "FIX_APN",
+        "when": "task_state.resolved == false and task_state.apn_broken == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkSuspension",
+        "subtask_type": "CHECK_SUSPENSION",
+        "when": "task_state.resolved == false and task_state.service_status != 'connected' and task_state.service_status != null and task_state.apn_broken == false and task_state.line_suspended == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "escalateContract",
+        "subtask_type": "ESCALATE",
+        "when": "task_state.resolved == false and task_state.escalated != true and task_state.line_suspended == true and task_state.contract_ended == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "findBill",
+        "subtask_type": "FIND_BILL",
+        "when": "task_state.resolved == false and task_state.line_suspended == true and task_state.contract_ended == false and task_state.pay_allowed == true and task_state.overdue_bill_id == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "requestPayment",
+        "subtask_type": "REQUEST_PAYMENT",
+        "when": "task_state.resolved == false and task_state.overdue_bill_id != null and task_state.payment_requested != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "makePayment",
+        "subtask_type": "MAKE_PAYMENT",
+        "when": "task_state.resolved == false and task_state.payment_requested == true and task_state.bill_paid != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "resumeLine",
+        "subtask_type": "RESUME_LINE",
+        "when": "task_state.resolved == false and task_state.bill_paid == true and task_state.line_suspended == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "rebootService",
+        "subtask_type": "REBOOT_SERVICE",
+        "when": "task_state.resolved == false and task_state.line_suspended == false and task_state.bill_paid == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "diagnoseData",
+        "subtask_type": "DIAGNOSE_DATA",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.speed_test == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkNetworkStatus",
+        "subtask_type": "CHECK_NETWORK_STATUS",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixRoamingDevice",
+        "subtask_type": "FIX_ROAMING_DEVICE",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == false and task_state.is_abroad == true and task_state.roaming_enabled_device == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixLineRoaming",
+        "subtask_type": "FIX_LINE_ROAMING",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == false and task_state.is_abroad == true and task_state.roaming_enabled_device == true and task_state.line_roaming_enabled != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixMobileData",
+        "subtask_type": "FIX_MOBILE_DATA",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == false and task_state.mobile_data_enabled == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkDataUsage",
+        "subtask_type": "CHECK_DATA_USAGE",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == false and task_state.mobile_data_enabled == true and task_state.data_usage_exceeded == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixDataUsage",
+        "subtask_type": "FIX_DATA_USAGE",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == false and task_state.data_usage_exceeded == true and task_state.refuel_allowed == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkDataSaver",
+        "subtask_type": "CHECK_DATA_SAVER",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true and task_state.data_saver_on == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixDataSaver",
+        "subtask_type": "FIX_DATA_SAVER",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true and task_state.data_saver_on == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkNetworkMode",
+        "subtask_type": "CHECK_NETWORK_MODE",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true and task_state.network_mode == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixNetworkMode",
+        "subtask_type": "FIX_NETWORK_MODE",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true and task_state.network_mode != '4g_5g_preferred' and task_state.network_mode != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkVpn",
+        "subtask_type": "CHECK_VPN",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true and task_state.vpn_active == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixVpn",
+        "subtask_type": "FIX_VPN",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true and task_state.vpn_active == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "verifySpeed",
+        "subtask_type": "VERIFY_SPEED",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "escalate",
+        "subtask_type": "ESCALATE",
+        "when": "task_state.resolved == false and task_state.escalated != true",
+        "expects": [],
+        "produces": []
+      }
+    ]
+  },
+  "no_service": {
+    "goal_template": "restore cellular service for <customer_name> (<phone_number>) until connected",
+    "success_when_all": [
+      "task_state.service_status == 'connected'"
+    ],
+    "task_state_schema": {
+      "fields": {
+        "goal": "string",
+        "customer_name": "string (from ticket)",
+        "phone_number": "string (from ticket)",
+        "customer_id": "string|null (IDENTIFY_CUSTOMER)",
+        "candidate_line_ids": "list|null (customer line_ids; RESOLVE_LINE walks it)",
+        "line_id": "string|null (line whose phone == phone_number; RESOLVE_LINE)",
+        "is_abroad": "bool|null (true only if ticket says abroad/traveling)",
+        "pay_allowed": "bool|null (ticket authorizes paying overdue bills)",
+        "refuel_allowed": "bool|null (ticket authorizes a data refuel)",
+        "refuel_gb": "number|null (GB authorized to refuel)",
+        "service_status": "string|null ('connected'/'no_service'/'searching')",
+        "airplane_mode": "bool|null",
+        "sim_status": "string|null (active/missing/locked_pin/locked_puk)",
+        "apn_broken": "bool|null",
+        "line_suspended": "bool|null",
+        "contract_ended": "bool|null",
+        "overdue_bill_id": "string|null",
+        "payment_requested": "bool|null",
+        "bill_paid": "bool|null",
+        "speed_test": "string|null",
+        "data_available": "bool|null (false iff 'no connection')",
+        "roaming_enabled_device": "bool|null",
+        "mobile_data_enabled": "bool|null",
+        "line_roaming_enabled": "bool|null",
+        "data_usage_exceeded": "bool|null",
+        "data_saver_on": "bool|null",
+        "network_mode": "string|null",
+        "vpn_active": "bool|null",
+        "can_send_mms": "bool|null",
+        "wifi_calling_on": "bool|null",
+        "mms_storage_perm": "bool|null",
+        "mms_sms_perm": "bool|null",
+        "mmsc_url_present": "bool|null",
+        "apn_rebooted": "bool|null",
+        "escalated": "bool|null (set once an ESCALATE transfers; halts downstream)",
+        "resolved": "bool (family goal met; ONLY terminal VERIFY_* / family-exclusive fixes set it)"
+      }
+    },
+    "init_rules": [
+      "customer_name, phone_number: extract verbatim from the ticket.",
+      "is_abroad: true ONLY if the ticket explicitly says the user is abroad/traveling; if it says at home, false; else null.",
+      "pay_allowed: true if the ticket says the user authorized paying their overdue bill(s); else null.",
+      "refuel_allowed / refuel_gb: 'will refuel 2.0 GB if necessary' -> refuel_allowed=true, refuel_gb=2.0; else null.",
+      "ALL diagnostic/phase fields start null and are filled ONLY by their subtask from real tool output. Never fabricate from the ticket.",
+      "resolved := false; escalated := false."
+    ],
+    "base_subtask_sequence": [
+      {
+        "name": "identifyCustomer",
+        "subtask_type": "IDENTIFY_CUSTOMER",
+        "when": "task_state.customer_id == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "resolveLine",
+        "subtask_type": "RESOLVE_LINE",
+        "when": "task_state.customer_id != null and task_state.line_id == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkService",
+        "subtask_type": "CHECK_SERVICE",
+        "when": "task_state.resolved == false and task_state.service_status == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixAirplane",
+        "subtask_type": "FIX_AIRPLANE",
+        "when": "task_state.resolved == false and task_state.airplane_mode == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixSim",
+        "subtask_type": "FIX_SIM",
+        "when": "task_state.resolved == false and task_state.sim_status == 'missing'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "escalateSim",
+        "subtask_type": "ESCALATE",
+        "when": "task_state.resolved == false and task_state.escalated != true and task_state.sim_status == 'locked_pin' or task_state.resolved == false and task_state.escalated != true and task_state.sim_status == 'locked_puk'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkApn",
+        "subtask_type": "CHECK_APN",
+        "when": "task_state.resolved == false and task_state.service_status != 'connected' and task_state.service_status != null and task_state.sim_status == 'active' and task_state.apn_broken == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixApn",
+        "subtask_type": "FIX_APN",
+        "when": "task_state.resolved == false and task_state.apn_broken == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkSuspension",
+        "subtask_type": "CHECK_SUSPENSION",
+        "when": "task_state.resolved == false and task_state.service_status != 'connected' and task_state.service_status != null and task_state.apn_broken == false and task_state.line_suspended == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "escalateContract",
+        "subtask_type": "ESCALATE",
+        "when": "task_state.resolved == false and task_state.escalated != true and task_state.line_suspended == true and task_state.contract_ended == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "findBill",
+        "subtask_type": "FIND_BILL",
+        "when": "task_state.resolved == false and task_state.line_suspended == true and task_state.contract_ended == false and task_state.pay_allowed == true and task_state.overdue_bill_id == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "requestPayment",
+        "subtask_type": "REQUEST_PAYMENT",
+        "when": "task_state.resolved == false and task_state.overdue_bill_id != null and task_state.payment_requested != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "makePayment",
+        "subtask_type": "MAKE_PAYMENT",
+        "when": "task_state.resolved == false and task_state.payment_requested == true and task_state.bill_paid != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "resumeLine",
+        "subtask_type": "RESUME_LINE",
+        "when": "task_state.resolved == false and task_state.bill_paid == true and task_state.line_suspended == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "rebootService",
+        "subtask_type": "REBOOT_SERVICE",
+        "when": "task_state.resolved == false and task_state.line_suspended == false and task_state.bill_paid == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "verifyService",
+        "subtask_type": "VERIFY_SERVICE",
+        "when": "task_state.resolved == false and task_state.escalated != true",
+        "expects": [],
+        "produces": []
+      }
+    ]
+  },
+  "mms": {
+    "goal_template": "restore MMS for <customer_name> (<phone_number>) until an MMS can be sent",
+    "success_when_all": [
+      "task_state.can_send_mms == true"
+    ],
+    "task_state_schema": {
+      "fields": {
+        "goal": "string",
+        "customer_name": "string (from ticket)",
+        "phone_number": "string (from ticket)",
+        "customer_id": "string|null (IDENTIFY_CUSTOMER)",
+        "candidate_line_ids": "list|null (customer line_ids; RESOLVE_LINE walks it)",
+        "line_id": "string|null (line whose phone == phone_number; RESOLVE_LINE)",
+        "is_abroad": "bool|null (true only if ticket says abroad/traveling)",
+        "pay_allowed": "bool|null (ticket authorizes paying overdue bills)",
+        "refuel_allowed": "bool|null (ticket authorizes a data refuel)",
+        "refuel_gb": "number|null (GB authorized to refuel)",
+        "service_status": "string|null ('connected'/'no_service'/'searching')",
+        "airplane_mode": "bool|null",
+        "sim_status": "string|null (active/missing/locked_pin/locked_puk)",
+        "apn_broken": "bool|null",
+        "line_suspended": "bool|null",
+        "contract_ended": "bool|null",
+        "overdue_bill_id": "string|null",
+        "payment_requested": "bool|null",
+        "bill_paid": "bool|null",
+        "speed_test": "string|null",
+        "data_available": "bool|null (false iff 'no connection')",
+        "roaming_enabled_device": "bool|null",
+        "mobile_data_enabled": "bool|null",
+        "line_roaming_enabled": "bool|null",
+        "data_usage_exceeded": "bool|null",
+        "data_saver_on": "bool|null",
+        "network_mode": "string|null",
+        "vpn_active": "bool|null",
+        "can_send_mms": "bool|null",
+        "wifi_calling_on": "bool|null",
+        "mms_storage_perm": "bool|null",
+        "mms_sms_perm": "bool|null",
+        "mmsc_url_present": "bool|null",
+        "apn_rebooted": "bool|null",
+        "escalated": "bool|null (set once an ESCALATE transfers; halts downstream)",
+        "resolved": "bool (family goal met; ONLY terminal VERIFY_* / family-exclusive fixes set it)"
+      }
+    },
+    "init_rules": [
+      "customer_name, phone_number: extract verbatim from the ticket.",
+      "is_abroad: true ONLY if the ticket explicitly says the user is abroad/traveling; if it says at home, false; else null.",
+      "pay_allowed: true if the ticket says the user authorized paying their overdue bill(s); else null.",
+      "refuel_allowed / refuel_gb: 'will refuel 2.0 GB if necessary' -> refuel_allowed=true, refuel_gb=2.0; else null.",
+      "ALL diagnostic/phase fields start null and are filled ONLY by their subtask from real tool output. Never fabricate from the ticket.",
+      "resolved := false; escalated := false."
+    ],
+    "base_subtask_sequence": [
+      {
+        "name": "identifyCustomer",
+        "subtask_type": "IDENTIFY_CUSTOMER",
+        "when": "task_state.customer_id == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "resolveLine",
+        "subtask_type": "RESOLVE_LINE",
+        "when": "task_state.customer_id != null and task_state.line_id == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkService",
+        "subtask_type": "CHECK_SERVICE",
+        "when": "task_state.resolved == false and task_state.service_status == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixAirplane",
+        "subtask_type": "FIX_AIRPLANE",
+        "when": "task_state.resolved == false and task_state.airplane_mode == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixSim",
+        "subtask_type": "FIX_SIM",
+        "when": "task_state.resolved == false and task_state.sim_status == 'missing'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "escalateSim",
+        "subtask_type": "ESCALATE",
+        "when": "task_state.resolved == false and task_state.escalated != true and task_state.sim_status == 'locked_pin' or task_state.resolved == false and task_state.escalated != true and task_state.sim_status == 'locked_puk'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkApn",
+        "subtask_type": "CHECK_APN",
+        "when": "task_state.resolved == false and task_state.service_status != 'connected' and task_state.service_status != null and task_state.sim_status == 'active' and task_state.apn_broken == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixApn",
+        "subtask_type": "FIX_APN",
+        "when": "task_state.resolved == false and task_state.apn_broken == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkSuspension",
+        "subtask_type": "CHECK_SUSPENSION",
+        "when": "task_state.resolved == false and task_state.service_status != 'connected' and task_state.service_status != null and task_state.apn_broken == false and task_state.line_suspended == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "escalateContract",
+        "subtask_type": "ESCALATE",
+        "when": "task_state.resolved == false and task_state.escalated != true and task_state.line_suspended == true and task_state.contract_ended == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "findBill",
+        "subtask_type": "FIND_BILL",
+        "when": "task_state.resolved == false and task_state.line_suspended == true and task_state.contract_ended == false and task_state.pay_allowed == true and task_state.overdue_bill_id == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "requestPayment",
+        "subtask_type": "REQUEST_PAYMENT",
+        "when": "task_state.resolved == false and task_state.overdue_bill_id != null and task_state.payment_requested != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "makePayment",
+        "subtask_type": "MAKE_PAYMENT",
+        "when": "task_state.resolved == false and task_state.payment_requested == true and task_state.bill_paid != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "resumeLine",
+        "subtask_type": "RESUME_LINE",
+        "when": "task_state.resolved == false and task_state.bill_paid == true and task_state.line_suspended == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "rebootService",
+        "subtask_type": "REBOOT_SERVICE",
+        "when": "task_state.resolved == false and task_state.line_suspended == false and task_state.bill_paid == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "diagnoseData",
+        "subtask_type": "DIAGNOSE_DATA",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.speed_test == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkNetworkStatus",
+        "subtask_type": "CHECK_NETWORK_STATUS",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixRoamingDevice",
+        "subtask_type": "FIX_ROAMING_DEVICE",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == false and task_state.is_abroad == true and task_state.roaming_enabled_device == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixLineRoaming",
+        "subtask_type": "FIX_LINE_ROAMING",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == false and task_state.is_abroad == true and task_state.roaming_enabled_device == true and task_state.line_roaming_enabled != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixMobileData",
+        "subtask_type": "FIX_MOBILE_DATA",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == false and task_state.mobile_data_enabled == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkDataUsage",
+        "subtask_type": "CHECK_DATA_USAGE",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == false and task_state.mobile_data_enabled == true and task_state.data_usage_exceeded == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixDataUsage",
+        "subtask_type": "FIX_DATA_USAGE",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == false and task_state.data_usage_exceeded == true and task_state.refuel_allowed == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkNetworkModeMms",
+        "subtask_type": "CHECK_NETWORK_MODE",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true and task_state.network_mode == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixNetworkModeMms",
+        "subtask_type": "FIX_NETWORK_MODE_MMS",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true and task_state.network_mode != '4g_5g_preferred' and task_state.network_mode != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkWifiCalling",
+        "subtask_type": "CHECK_WIFI_CALLING",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true and task_state.wifi_calling_on == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixWifiCalling",
+        "subtask_type": "FIX_WIFI_CALLING",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true and task_state.wifi_calling_on == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkPerms",
+        "subtask_type": "CHECK_MMS_PERMS",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true and task_state.mms_sms_perm == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixStoragePerm",
+        "subtask_type": "FIX_STORAGE_PERM",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true and task_state.mms_storage_perm == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixSmsPerm",
+        "subtask_type": "FIX_SMS_PERM",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true and task_state.mms_sms_perm == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkApnMms",
+        "subtask_type": "CHECK_APN_MMS",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true and task_state.mmsc_url_present == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "fixApnMmsReset",
+        "subtask_type": "RESET_APN_MMS",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true and task_state.mmsc_url_present == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "rebootMms",
+        "subtask_type": "REBOOT_MMS",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true and task_state.mmsc_url_present == true and task_state.apn_rebooted != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "retestMms",
+        "subtask_type": "RETEST_MMS",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true and task_state.apn_rebooted == true and task_state.can_send_mms == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "verifyMms",
+        "subtask_type": "VERIFY_MMS",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.data_available == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "escalate",
+        "subtask_type": "ESCALATE",
+        "when": "task_state.resolved == false and task_state.escalated != true",
+        "expects": [],
+        "produces": []
+      }
+    ]
+  }
+}

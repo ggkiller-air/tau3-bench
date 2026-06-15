@@ -1,0 +1,1771 @@
+{
+  "__comment__": "Action primitives for tau2/telecom, consumed by the 3 families in task_spec.json (mobile_data, no_service, mms). ESSA subtask_specs adapted for tool-calling: each base_action is a tool CALL {tool,args,when} instead of a text command. The small model runs two roles per subtask: EXECUTOR (pick the next tool call per base_actions + executor_sys_rules, restricted by Python to this subtask's tools) and STATE_UPDATER (parse the tool result into patch_ops over task_state per parse_rules + patch_ops_policy). Tool names and return-string formats were verified against src/tau2/domains/telecom/{tools.py,user_tools.py}. Several subtask_types are SHARED across families (IDENTIFY_CUSTOMER, CHECK_NETWORK_MODE, ESCALATE) — selection is by the sequence entry's subtask_type; per-task bookkeeping is by the entry's name.",
+  "__conventions__": {
+    "device_tools_no_args": "run_speed_test, check_network_status, check_status_bar, check_data_restriction_status, check_network_mode_preference, check_vpn_status, check_wifi_calling_status, check_apn_settings, can_send_mms, toggle_roaming, toggle_data, toggle_data_saver_mode, toggle_airplane_mode, toggle_wifi_calling, reseat_sim_card, reset_apn_settings, reboot_device, disconnect_vpn, make_payment take NO args (they operate on the user's own device; solo mode routes them to the user toolkit).",
+    "backend_tools": "get_customer_by_phone, get_details_by_id, get_data_usage, get_bills_for_customer, enable_roaming, refuel_data, send_payment_request, resume_line, transfer_to_human_agents take backend ids (customer_id/line_id/bill_id).",
+    "device_tools_with_args": "set_network_mode_preference(mode), grant_app_permission(app_name, permission).",
+    "speed_parse": "run_speed_test returns 'Speed Test Result: <n> Mbps (<Desc>). ...' on success, or 'Speed test failed: No Connection.' when data is down. Map: 'No Connection'->'no connection', '(Excellent)'->'excellent', '(Good)'->'good', '(Fair)'->'fair', '(Poor)'->'poor', '(Very Poor)'->'very poor'. ALSO set data_available: false when 'no connection', true for any real speed. When speed_test=='excellent', ALSO set resolved=true.",
+    "toggle_caution": "toggle_* tools FLIP state. Only call them when a read shows the wrong state, and at most once per fix (the base_action `when` and the retest_guard enforce this).",
+    "service_parse": "check_network_status returns multiple lines. 'Cellular Connection: <connected|no_service|searching>' -> service_status; 'Airplane Mode: ON/OFF' -> airplane_mode; 'SIM Card Status: <active|missing|locked_pin|locked_puk>' -> sim_status. When service_status=='connected' ALSO set resolved=true."
+  },
+  "IDENTIFY_CUSTOMER": {
+    "goal_template": "resolve the backend customer_id and list the customer's line_ids",
+    "reads": [
+      "phone_number"
+    ],
+    "base_actions": [
+      {
+        "tool": "get_customer_by_phone",
+        "args": {
+          "phone_number": "<task_state.phone_number>"
+        },
+        "when": "task_state.customer_id == null"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call get_customer_by_phone ONCE with task_state.phone_number; it returns a Customer with customer_id and a line_ids list.",
+      "This subtask only identifies the customer — do NOT probe individual lines here (RESOLVE_LINE does that) and do NOT call any device tool."
+    ],
+    "parse_rules": [
+      "set customer_id = Customer.customer_id.",
+      "set candidate_line_ids = the Customer's line_ids list verbatim (e.g. [\"L1001\",\"L1002\",\"L1003\"]); RESOLVE_LINE will walk it."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.customer_id"
+        },
+        {
+          "op": "set",
+          "path": "task_state.candidate_line_ids"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.customer_id != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.customer_id\",\"value\":\"C1001\"}, {\"op\":\"set\",\"path\":\"task_state.candidate_line_ids\",\"value\":[\"L1001\",\"L1002\",\"L1003\"]} ] }"
+  },
+  "RESOLVE_LINE": {
+    "goal_template": "find the line_id whose phone_number == <phone_number> by walking candidate_line_ids one at a time",
+    "reads": [
+      "phone_number",
+      "candidate_line_ids"
+    ],
+    "base_actions": [
+      {
+        "tool": "get_details_by_id",
+        "args": {
+          "id": "<the FIRST id in task_state.candidate_line_ids>"
+        },
+        "when": "task_state.line_id == null"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call get_details_by_id with id = the FIRST id in task_state.candidate_line_ids to inspect that one line.",
+      "Do NOT call get_customer_by_phone again and do NOT call any device tool here."
+    ],
+    "parse_rules": [
+      "Look at the line returned by get_details_by_id.",
+      "If its phone_number == task_state.phone_number, set task_state.line_id to that line's line_id (you are done).",
+      "Otherwise it is the wrong line: set task_state.candidate_line_ids to the SAME list with its FIRST element removed (drop the id you just checked), so the next call tries a different line. Do NOT set line_id in that case."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.line_id"
+        },
+        {
+          "op": "set",
+          "path": "task_state.candidate_line_ids"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.line_id != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.line_id\",\"value\":\"L1002\"} ] }   (or, when the checked line did NOT match: { \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.candidate_line_ids\",\"value\":[\"L1002\",\"L1003\"]} ] })"
+  },
+  "DIAGNOSE_DATA": {
+    "goal_template": "measure current mobile data speed",
+    "reads": [],
+    "base_actions": [
+      {
+        "tool": "run_speed_test",
+        "args": {},
+        "when": "always"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call run_speed_test with no arguments.",
+      "This is read-only; never apply a fix here."
+    ],
+    "parse_rules": [
+      "Map the result string to one speed word per __conventions__.speed_parse and set task_state.speed_test.",
+      "Set task_state.data_available = false if the result is 'no connection', otherwise true.",
+      "If the word is 'excellent',."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.speed_test"
+        },
+        {
+          "op": "set",
+          "path": "task_state.data_available"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.speed_test != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.speed_test\",\"value\":\"no connection\"}, {\"op\":\"set\",\"path\":\"task_state.data_available\",\"value\":false} ] }"
+  },
+  "CHECK_NETWORK_STATUS": {
+    "goal_template": "read device roaming and mobile-data toggles",
+    "reads": [],
+    "base_actions": [
+      {
+        "tool": "check_network_status",
+        "args": {},
+        "when": "always"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call check_network_status with no arguments.",
+      "Read-only; never apply a fix here."
+    ],
+    "parse_rules": [
+      "From 'Data Roaming Enabled: Yes/No' set task_state.roaming_enabled_device (Yes->true, No->false).",
+      "From 'Mobile Data Enabled: Yes/No' set task_state.mobile_data_enabled (Yes->true, No->false)."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.roaming_enabled_device"
+        },
+        {
+          "op": "set",
+          "path": "task_state.mobile_data_enabled"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.roaming_enabled_device != null",
+      "task_state.mobile_data_enabled != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.roaming_enabled_device\",\"value\":false}, {\"op\":\"set\",\"path\":\"task_state.mobile_data_enabled\",\"value\":true} ] }"
+  },
+  "FIX_ROAMING_DEVICE": {
+    "goal_template": "turn Data Roaming ON on the device, then retest",
+    "reads": [
+      "roaming_enabled_device",
+      "is_abroad"
+    ],
+    "on_enter_reset": [
+      "speed_test",
+      "data_available"
+    ],
+    "retest_guard": {
+      "when": "task_state.roaming_enabled_device == true",
+      "restrict_to": [
+        "run_speed_test"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "toggle_roaming",
+        "args": {},
+        "when": "task_state.roaming_enabled_device == false"
+      },
+      {
+        "tool": "run_speed_test",
+        "args": {},
+        "when": "toggle_roaming just returned 'Data Roaming is now ON'"
+      }
+    ],
+    "executor_sys_rules": [
+      "Step 1: call toggle_roaming ONLY if task_state.roaming_enabled_device is false (it flips state; do not call twice).",
+      "Step 2: after the toggle confirms 'Data Roaming is now ON.', call run_speed_test to retest.",
+      "Do not touch backend line roaming here (that is FIX_LINE_ROAMING)."
+    ],
+    "parse_rules": [
+      "On 'Data Roaming is now ON.' set task_state.roaming_enabled_device=true.",
+      "Set task_state.speed_test / data_available / resolved ONLY from a run_speed_test result. That result is EITHER 'Speed Test Result: <n> Mbps (<Desc>).' (success: map <Desc> -> speed word, data_available=true) OR 'Speed test failed: No Connection.' (data still down: speed_test='no connection', data_available=false). NEVER set these from a toggle/enable result — its Status Bar 'Excellent' is SIGNAL strength, NOT data speed, and means nothing here."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.roaming_enabled_device"
+        },
+        {
+          "op": "set",
+          "path": "task_state.speed_test"
+        },
+        {
+          "op": "set",
+          "path": "task_state.data_available"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.roaming_enabled_device == true",
+      "task_state.speed_test != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.roaming_enabled_device\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.speed_test\",\"value\":\"excellent\"}, {\"op\":\"set\",\"path\":\"task_state.data_available\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "FIX_LINE_ROAMING": {
+    "goal_template": "ensure the backend LINE is roaming-enabled (at no cost), then retest",
+    "reads": [
+      "customer_id",
+      "line_id"
+    ],
+    "on_enter_reset": [
+      "speed_test",
+      "data_available"
+    ],
+    "base_actions": [
+      {
+        "tool": "get_details_by_id",
+        "args": {
+          "id": "<task_state.line_id>"
+        },
+        "when": "task_state.line_roaming_enabled == null"
+      },
+      {
+        "tool": "enable_roaming",
+        "args": {
+          "customer_id": "<task_state.customer_id>",
+          "line_id": "<task_state.line_id>"
+        },
+        "when": "task_state.line_roaming_enabled == false"
+      },
+      {
+        "tool": "run_speed_test",
+        "args": {},
+        "when": "enable_roaming just succeeded"
+      }
+    ],
+    "executor_sys_rules": [
+      "First read the line via get_details_by_id(task_state.line_id) to learn whether roaming is already enabled on the line.",
+      "Call enable_roaming ONLY if the line is not already roaming-enabled. Enabling is free to the user.",
+      "After enable_roaming succeeds, call run_speed_test to retest."
+    ],
+    "parse_rules": [
+      "From the line details set task_state.line_roaming_enabled (the line's roaming_enabled field: true/false).",
+      "After enable_roaming succeeds ('Roaming enabled successfully' or 'already enabled') set task_state.line_roaming_enabled=true.",
+      "Set task_state.speed_test / data_available / resolved ONLY from a run_speed_test result. That result is EITHER 'Speed Test Result: <n> Mbps (<Desc>).' (success: map <Desc> -> speed word, data_available=true) OR 'Speed test failed: No Connection.' (data still down: speed_test='no connection', data_available=false). NEVER set these from a toggle/enable result — its Status Bar 'Excellent' is SIGNAL strength, NOT data speed, and means nothing here."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.line_roaming_enabled"
+        },
+        {
+          "op": "set",
+          "path": "task_state.speed_test"
+        },
+        {
+          "op": "set",
+          "path": "task_state.data_available"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.line_roaming_enabled == true",
+      "task_state.speed_test != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.line_roaming_enabled\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.speed_test\",\"value\":\"excellent\"}, {\"op\":\"set\",\"path\":\"task_state.data_available\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "FIX_MOBILE_DATA": {
+    "goal_template": "turn Mobile Data ON on the device, then retest",
+    "reads": [
+      "mobile_data_enabled"
+    ],
+    "on_enter_reset": [
+      "speed_test",
+      "data_available"
+    ],
+    "retest_guard": {
+      "when": "task_state.mobile_data_enabled == true",
+      "restrict_to": [
+        "run_speed_test"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "toggle_data",
+        "args": {},
+        "when": "task_state.mobile_data_enabled == false"
+      },
+      {
+        "tool": "run_speed_test",
+        "args": {},
+        "when": "toggle_data just turned mobile data ON"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call toggle_data ONLY if task_state.mobile_data_enabled is false (it flips state; call at most once).",
+      "After mobile data is ON, call run_speed_test to retest."
+    ],
+    "parse_rules": [
+      "When the toggle confirms 'Mobile Data is now ON.' set task_state.mobile_data_enabled=true.",
+      "Set task_state.speed_test / data_available / resolved ONLY from a run_speed_test result. That result is EITHER 'Speed Test Result: <n> Mbps (<Desc>).' (success: map <Desc> -> speed word, data_available=true) OR 'Speed test failed: No Connection.' (data still down: speed_test='no connection', data_available=false). NEVER set these from a toggle/enable result — its Status Bar 'Excellent' is SIGNAL strength, NOT data speed, and means nothing here."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.mobile_data_enabled"
+        },
+        {
+          "op": "set",
+          "path": "task_state.speed_test"
+        },
+        {
+          "op": "set",
+          "path": "task_state.data_available"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.mobile_data_enabled == true",
+      "task_state.speed_test != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.mobile_data_enabled\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.speed_test\",\"value\":\"excellent\"}, {\"op\":\"set\",\"path\":\"task_state.data_available\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "CHECK_DATA_USAGE": {
+    "goal_template": "check whether the line's data allowance is exhausted",
+    "reads": [
+      "customer_id",
+      "line_id"
+    ],
+    "base_actions": [
+      {
+        "tool": "get_data_usage",
+        "args": {
+          "customer_id": "<task_state.customer_id>",
+          "line_id": "<task_state.line_id>"
+        },
+        "when": "always"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call get_data_usage once with customer_id and line_id.",
+      "Read-only; never apply a fix here."
+    ],
+    "parse_rules": [
+      "Set task_state.data_usage_exceeded = (data_used_gb >= data_limit_gb + data_refueling_gb)."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.data_usage_exceeded"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.data_usage_exceeded != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.data_usage_exceeded\",\"value\":true} ] }"
+  },
+  "FIX_DATA_USAGE": {
+    "goal_template": "refuel 2.0 GB (the policy maximum), then retest",
+    "reads": [
+      "customer_id",
+      "line_id",
+      "refuel_gb",
+      "refuel_allowed"
+    ],
+    "on_enter_reset": [
+      "speed_test",
+      "data_available"
+    ],
+    "retest_guard": {
+      "when": "task_state.data_usage_exceeded == false",
+      "restrict_to": [
+        "run_speed_test"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "refuel_data",
+        "args": {
+          "customer_id": "<task_state.customer_id>",
+          "line_id": "<task_state.line_id>",
+          "gb_amount": "<task_state.refuel_gb>"
+        },
+        "when": "task_state.data_usage_exceeded == true"
+      },
+      {
+        "tool": "run_speed_test",
+        "args": {},
+        "when": "refuel_data just succeeded"
+      }
+    ],
+    "executor_sys_rules": [
+      "Data refueling is a STANDARD remediation (telecom policy: max 2GB, no special permission needed — unlike payments).",
+      "Refuel EXACTLY 2.0 GB: call refuel_data(customer_id=task_state.customer_id, line_id=task_state.line_id, gb_amount=2.0).",
+      "Do NOT change the plan. After refuel_data succeeds, call run_speed_test to retest."
+    ],
+    "parse_rules": [
+      "After refuel_data succeeds ('Successfully added ... GB') set task_state.data_usage_exceeded=false.",
+      "Set task_state.speed_test / data_available / resolved ONLY from a run_speed_test result. That result is EITHER 'Speed Test Result: <n> Mbps (<Desc>).' (success: map <Desc> -> speed word, data_available=true) OR 'Speed test failed: No Connection.' (data still down: speed_test='no connection', data_available=false). NEVER set these from a toggle/enable result — its Status Bar 'Excellent' is SIGNAL strength, NOT data speed, and means nothing here."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.data_usage_exceeded"
+        },
+        {
+          "op": "set",
+          "path": "task_state.speed_test"
+        },
+        {
+          "op": "set",
+          "path": "task_state.data_available"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.speed_test != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.data_usage_exceeded\",\"value\":false}, {\"op\":\"set\",\"path\":\"task_state.speed_test\",\"value\":\"excellent\"}, {\"op\":\"set\",\"path\":\"task_state.data_available\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "CHECK_DATA_SAVER": {
+    "goal_template": "check whether Data Saver mode is limiting speed",
+    "reads": [],
+    "base_actions": [
+      {
+        "tool": "check_data_restriction_status",
+        "args": {},
+        "when": "always"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call check_data_restriction_status with no arguments.",
+      "Read-only; never apply a fix here."
+    ],
+    "parse_rules": [
+      "From 'Data Saver mode is ON/OFF' set task_state.data_saver_on (ON->true, OFF->false)."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.data_saver_on"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.data_saver_on != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.data_saver_on\",\"value\":true} ] }"
+  },
+  "FIX_DATA_SAVER": {
+    "goal_template": "turn Data Saver mode OFF, then retest",
+    "reads": [
+      "data_saver_on"
+    ],
+    "on_enter_reset": [
+      "speed_test",
+      "data_available"
+    ],
+    "retest_guard": {
+      "when": "task_state.data_saver_on == false",
+      "restrict_to": [
+        "run_speed_test"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "toggle_data_saver_mode",
+        "args": {},
+        "when": "task_state.data_saver_on == true"
+      },
+      {
+        "tool": "run_speed_test",
+        "args": {},
+        "when": "Data Saver just turned OFF"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call toggle_data_saver_mode ONLY if task_state.data_saver_on is true (it flips state; call at most once).",
+      "After Data Saver is OFF, call run_speed_test to retest."
+    ],
+    "parse_rules": [
+      "When the toggle confirms 'Data Saver Mode is now OFF.' set task_state.data_saver_on=false.",
+      "Set task_state.speed_test / data_available / resolved ONLY from a run_speed_test result. That result is EITHER 'Speed Test Result: <n> Mbps (<Desc>).' (success: map <Desc> -> speed word, data_available=true, resolved=true ONLY if <Desc> is Excellent) OR 'Speed test failed: No Connection.' (data still down: speed_test='no connection', data_available=false, resolved stays false). NEVER set these from a toggle/enable result — its Status Bar 'Excellent' is SIGNAL strength, NOT data speed, and means nothing here."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.data_saver_on"
+        },
+        {
+          "op": "set",
+          "path": "task_state.speed_test"
+        },
+        {
+          "op": "set",
+          "path": "task_state.data_available"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.data_saver_on == false",
+      "task_state.speed_test != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.data_saver_on\",\"value\":false}, {\"op\":\"set\",\"path\":\"task_state.speed_test\",\"value\":\"excellent\"}, {\"op\":\"set\",\"path\":\"task_state.data_available\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "CHECK_NETWORK_MODE": {
+    "goal_template": "read the phone's preferred network mode",
+    "reads": [],
+    "base_actions": [
+      {
+        "tool": "check_network_mode_preference",
+        "args": {},
+        "when": "always"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call check_network_mode_preference with no arguments.",
+      "Read-only; never apply a fix here."
+    ],
+    "parse_rules": [
+      "From 'Network Mode Preference: <value>' set task_state.network_mode to that value verbatim (e.g. '2g_only', '4g_5g_preferred')."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.network_mode"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.network_mode != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.network_mode\",\"value\":\"2g_only\"} ] }"
+  },
+  "FIX_NETWORK_MODE": {
+    "goal_template": "set the network mode to one that includes 5G, then retest speed",
+    "reads": [
+      "network_mode"
+    ],
+    "on_enter_reset": [
+      "speed_test",
+      "data_available"
+    ],
+    "retest_guard": {
+      "when": "task_state.network_mode == '4g_5g_preferred'",
+      "restrict_to": [
+        "run_speed_test"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "set_network_mode_preference",
+        "args": {
+          "mode": "4g_5g_preferred"
+        },
+        "when": "task_state.network_mode != '4g_5g_preferred'"
+      },
+      {
+        "tool": "run_speed_test",
+        "args": {},
+        "when": "the network mode was just set to 4g_5g_preferred"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call set_network_mode_preference with mode='4g_5g_preferred' (an option that includes 5G) if the current mode is an older/limiting type.",
+      "After the mode is set, call run_speed_test to retest."
+    ],
+    "parse_rules": [
+      "After 'Preferred Network Mode set to: 4g_5g_preferred' set task_state.network_mode='4g_5g_preferred'.",
+      "Set task_state.speed_test / data_available / resolved ONLY from a run_speed_test result. That result is EITHER 'Speed Test Result: <n> Mbps (<Desc>).' (success: map <Desc> -> speed word, data_available=true, resolved=true ONLY if <Desc> is Excellent) OR 'Speed test failed: No Connection.' (data still down: speed_test='no connection', data_available=false, resolved stays false). NEVER set these from a toggle/enable result — its Status Bar 'Excellent' is SIGNAL strength, NOT data speed, and means nothing here."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.network_mode"
+        },
+        {
+          "op": "set",
+          "path": "task_state.speed_test"
+        },
+        {
+          "op": "set",
+          "path": "task_state.data_available"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.network_mode == '4g_5g_preferred'",
+      "task_state.speed_test != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.network_mode\",\"value\":\"4g_5g_preferred\"}, {\"op\":\"set\",\"path\":\"task_state.speed_test\",\"value\":\"excellent\"}, {\"op\":\"set\",\"path\":\"task_state.data_available\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "CHECK_VPN": {
+    "goal_template": "check whether a VPN is active (it can degrade speed)",
+    "reads": [],
+    "base_actions": [
+      {
+        "tool": "check_vpn_status",
+        "args": {},
+        "when": "always"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call check_vpn_status with no arguments.",
+      "Read-only; never apply a fix here."
+    ],
+    "parse_rules": [
+      "If the result says 'VPN is ON and connected' set task_state.vpn_active=true; if 'VPN is turned OFF' or 'not connected' set task_state.vpn_active=false."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.vpn_active"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.vpn_active != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.vpn_active\",\"value\":true} ] }"
+  },
+  "FIX_VPN": {
+    "goal_template": "disconnect the active VPN, then retest speed",
+    "reads": [
+      "vpn_active"
+    ],
+    "on_enter_reset": [
+      "speed_test",
+      "data_available"
+    ],
+    "retest_guard": {
+      "when": "task_state.vpn_active == false",
+      "restrict_to": [
+        "run_speed_test"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "disconnect_vpn",
+        "args": {},
+        "when": "task_state.vpn_active == true"
+      },
+      {
+        "tool": "run_speed_test",
+        "args": {},
+        "when": "the VPN was just disconnected"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call disconnect_vpn ONLY if task_state.vpn_active is true.",
+      "After the VPN is disconnected, call run_speed_test to retest."
+    ],
+    "parse_rules": [
+      "After 'VPN disconnected successfully' set task_state.vpn_active=false.",
+      "Set task_state.speed_test / data_available / resolved ONLY from a run_speed_test result. That result is EITHER 'Speed Test Result: <n> Mbps (<Desc>).' (success: map <Desc> -> speed word, data_available=true, resolved=true ONLY if <Desc> is Excellent) OR 'Speed test failed: No Connection.' (data still down: speed_test='no connection', data_available=false, resolved stays false). NEVER set these from a toggle/enable result — its Status Bar 'Excellent' is SIGNAL strength, NOT data speed, and means nothing here."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.vpn_active"
+        },
+        {
+          "op": "set",
+          "path": "task_state.speed_test"
+        },
+        {
+          "op": "set",
+          "path": "task_state.data_available"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.vpn_active == false",
+      "task_state.speed_test != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.vpn_active\",\"value\":false}, {\"op\":\"set\",\"path\":\"task_state.speed_test\",\"value\":\"excellent\"}, {\"op\":\"set\",\"path\":\"task_state.data_available\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "CHECK_SERVICE": {
+    "goal_template": "read airplane mode, SIM status, and cellular connection status",
+    "reads": [],
+    "base_actions": [
+      {
+        "tool": "check_network_status",
+        "args": {},
+        "when": "always"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call check_network_status with no arguments.",
+      "Read-only; never apply a fix here."
+    ],
+    "parse_rules": [
+      "From 'Airplane Mode: ON/OFF' set task_state.airplane_mode (ON->true, OFF->false).",
+      "From 'SIM Card Status: <v>' set task_state.sim_status (one of 'active','missing','locked_pin','locked_puk').",
+      "From 'Cellular Connection: <v>' set task_state.service_status (one of 'connected','no_service','searching').",
+      "If service_status=='connected'."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.airplane_mode"
+        },
+        {
+          "op": "set",
+          "path": "task_state.sim_status"
+        },
+        {
+          "op": "set",
+          "path": "task_state.service_status"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.service_status != null",
+      "task_state.sim_status != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.airplane_mode\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.sim_status\",\"value\":\"active\"}, {\"op\":\"set\",\"path\":\"task_state.service_status\",\"value\":\"no_service\"} ] }"
+  },
+  "FIX_AIRPLANE": {
+    "goal_template": "turn Airplane Mode OFF, then recheck service",
+    "reads": [
+      "airplane_mode"
+    ],
+    "on_enter_reset": [
+      "service_status"
+    ],
+    "retest_guard": {
+      "when": "task_state.airplane_mode == false",
+      "restrict_to": [
+        "check_network_status"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "toggle_airplane_mode",
+        "args": {},
+        "when": "task_state.airplane_mode == true"
+      },
+      {
+        "tool": "check_network_status",
+        "args": {},
+        "when": "airplane mode was just turned OFF"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call toggle_airplane_mode ONLY if task_state.airplane_mode is true (it flips state; call at most once).",
+      "After the toggle confirms 'Airplane Mode is now OFF.', call check_network_status to confirm service is restored."
+    ],
+    "parse_rules": [
+      "On 'Airplane Mode is now OFF.' set task_state.airplane_mode=false.",
+      "On a check_network_status result set task_state.service_status from 'Cellular Connection: <v>'."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.airplane_mode"
+        },
+        {
+          "op": "set",
+          "path": "task_state.service_status"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.airplane_mode == false",
+      "task_state.service_status != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.airplane_mode\",\"value\":false}, {\"op\":\"set\",\"path\":\"task_state.service_status\",\"value\":\"connected\"}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "FIX_SIM": {
+    "goal_template": "reseat the SIM card, then recheck service",
+    "reads": [
+      "sim_status"
+    ],
+    "on_enter_reset": [
+      "service_status"
+    ],
+    "retest_guard": {
+      "when": "task_state.sim_status == 'active'",
+      "restrict_to": [
+        "check_network_status"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "reseat_sim_card",
+        "args": {},
+        "when": "task_state.sim_status == 'missing'"
+      },
+      {
+        "tool": "check_network_status",
+        "args": {},
+        "when": "the SIM was just re-seated"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call reseat_sim_card ONLY if task_state.sim_status is 'missing'.",
+      "After 'SIM card re-seated successfully.', call check_network_status to confirm service is restored."
+    ],
+    "parse_rules": [
+      "On 'SIM card re-seated successfully.' set task_state.sim_status='active'.",
+      "On a check_network_status result set task_state.service_status from 'Cellular Connection: <v>'."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.sim_status"
+        },
+        {
+          "op": "set",
+          "path": "task_state.service_status"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.sim_status == 'active'",
+      "task_state.service_status != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.sim_status\",\"value\":\"active\"}, {\"op\":\"set\",\"path\":\"task_state.service_status\",\"value\":\"connected\"}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "CHECK_APN": {
+    "goal_template": "check whether the APN settings are broken",
+    "reads": [],
+    "base_actions": [
+      {
+        "tool": "check_apn_settings",
+        "args": {},
+        "when": "always"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call check_apn_settings with no arguments.",
+      "Read-only; never apply a fix here."
+    ],
+    "parse_rules": [
+      "From 'Current APN Name: <v>' set task_state.apn_broken = true if the name is 'broken' or 'Not Set', otherwise false (a working APN shows a normal carrier name like 'internet')."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.apn_broken"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.apn_broken != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.apn_broken\",\"value\":true} ] }"
+  },
+  "FIX_APN": {
+    "goal_template": "reset APN settings and reboot, then recheck service",
+    "reads": [
+      "apn_broken"
+    ],
+    "on_enter_reset": [
+      "service_status"
+    ],
+    "retest_guard": {
+      "when": "task_state.apn_broken == false",
+      "restrict_to": [
+        "reboot_device",
+        "check_network_status"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "reset_apn_settings",
+        "args": {},
+        "when": "task_state.apn_broken == true and APN not yet reset"
+      },
+      {
+        "tool": "reboot_device",
+        "args": {},
+        "when": "APN reset has been requested but device not yet rebooted"
+      },
+      {
+        "tool": "check_network_status",
+        "args": {},
+        "when": "the device was just rebooted"
+      }
+    ],
+    "executor_sys_rules": [
+      "Step 1: call reset_apn_settings (the reset applies on the next reboot).",
+      "Step 2: call reboot_device so the reset takes effect.",
+      "Step 3: call check_network_status to confirm service is restored.",
+      "Call each of these at most once, in this order."
+    ],
+    "parse_rules": [
+      "After reset_apn_settings ('APN settings will reset at reboot.') set task_state.apn_broken=false.",
+      "Set task_state.service_status ONLY from a check_network_status 'Cellular Connection: <v>' line (NOT from the reset/reboot status-bar text)."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.apn_broken"
+        },
+        {
+          "op": "set",
+          "path": "task_state.service_status"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.service_status != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.apn_broken\",\"value\":false}, {\"op\":\"set\",\"path\":\"task_state.service_status\",\"value\":\"connected\"}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "CHECK_SUSPENSION": {
+    "goal_template": "check whether the line is suspended and whether its contract has ended",
+    "reads": [
+      "line_id"
+    ],
+    "base_actions": [
+      {
+        "tool": "get_details_by_id",
+        "args": {
+          "id": "<task_state.line_id>"
+        },
+        "when": "always"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call get_details_by_id(task_state.line_id) once to read the line.",
+      "Read-only; never apply a fix here."
+    ],
+    "parse_rules": [
+      "From the line's status field set task_state.line_suspended (status 'Suspended' -> true, 'Active' -> false).",
+      "You MUST ALSO set task_state.contract_ended from the line's contract_end_date in the SAME response: it is true ONLY if that date is strictly before the current date 2025-02-25, otherwise false. Examples: '2026-12-31' -> false (2026 is after 2025); '2025-06-30' -> false; '2025-01-31' or any 2024 date -> true. Never omit contract_ended."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.line_suspended"
+        },
+        {
+          "op": "set",
+          "path": "task_state.contract_ended"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.line_suspended != null",
+      "task_state.contract_ended != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.line_suspended\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.contract_ended\",\"value\":false} ] }"
+  },
+  "FIND_BILL": {
+    "goal_template": "find the customer's overdue bill",
+    "reads": [
+      "customer_id"
+    ],
+    "base_actions": [
+      {
+        "tool": "get_bills_for_customer",
+        "args": {
+          "customer_id": "<task_state.customer_id>"
+        },
+        "when": "always"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call get_bills_for_customer(task_state.customer_id) once.",
+      "Read-only; never apply a fix here."
+    ],
+    "parse_rules": [
+      "Set task_state.overdue_bill_id = the bill_id of the bill whose status is 'Overdue'."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.overdue_bill_id"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.overdue_bill_id != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.overdue_bill_id\",\"value\":\"B1234321\"} ] }"
+  },
+  "REQUEST_PAYMENT": {
+    "goal_template": "send the customer a payment request for the overdue bill",
+    "reads": [
+      "customer_id",
+      "overdue_bill_id"
+    ],
+    "base_actions": [
+      {
+        "tool": "send_payment_request",
+        "args": {
+          "customer_id": "<task_state.customer_id>",
+          "bill_id": "<task_state.overdue_bill_id>"
+        },
+        "when": "task_state.payment_requested != true"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call send_payment_request(customer_id, bill_id=task_state.overdue_bill_id) once. The bill is already confirmed overdue."
+    ],
+    "parse_rules": [
+      "After 'Payment request sent to the customer' set task_state.payment_requested=true."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.payment_requested"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.payment_requested == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.payment_requested\",\"value\":true} ] }"
+  },
+  "MAKE_PAYMENT": {
+    "goal_template": "accept the payment request to pay the overdue bill",
+    "reads": [],
+    "base_actions": [
+      {
+        "tool": "make_payment",
+        "args": {},
+        "when": "task_state.payment_requested == true and task_state.bill_paid != true"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call make_payment with no arguments to pay the pending payment request (the user authorized this)."
+    ],
+    "parse_rules": [
+      "After 'Payment of ... has been made for bill ...' set task_state.bill_paid=true."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.bill_paid"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.bill_paid == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.bill_paid\",\"value\":true} ] }"
+  },
+  "RESUME_LINE": {
+    "goal_template": "resume the suspended line now that the bill is paid",
+    "reads": [
+      "customer_id",
+      "line_id"
+    ],
+    "base_actions": [
+      {
+        "tool": "resume_line",
+        "args": {
+          "customer_id": "<task_state.customer_id>",
+          "line_id": "<task_state.line_id>"
+        },
+        "when": "task_state.bill_paid == true and task_state.line_suspended == true"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call resume_line(customer_id, line_id) once. You may resume because all overdue bills are paid and the contract has not ended."
+    ],
+    "parse_rules": [
+      "After 'Line resumed successfully' set task_state.line_suspended=false."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.line_suspended"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.line_suspended == false"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.line_suspended\",\"value\":false} ] }"
+  },
+  "REBOOT_SERVICE": {
+    "goal_template": "reboot the device so the resumed line picks up service, then recheck",
+    "reads": [],
+    "on_enter_reset": [
+      "service_status"
+    ],
+    "retest_guard": {
+      "when": "task_state.service_status == 'searching'",
+      "restrict_to": [
+        "check_network_status"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "reboot_device",
+        "args": {},
+        "when": "the device has not been rebooted since the line resumed"
+      },
+      {
+        "tool": "check_network_status",
+        "args": {},
+        "when": "the device was just rebooted"
+      }
+    ],
+    "executor_sys_rules": [
+      "Step 1: call reboot_device (after resuming a line the user must reboot to get service).",
+      "Step 2: call check_network_status to confirm service is restored."
+    ],
+    "parse_rules": [
+      "Set task_state.service_status ONLY from a check_network_status 'Cellular Connection: <v>' line."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.service_status"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.service_status != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.service_status\",\"value\":\"connected\"}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "DIAGNOSE_MMS": {
+    "goal_template": "check whether an MMS message can be sent",
+    "reads": [],
+    "base_actions": [
+      {
+        "tool": "can_send_mms",
+        "args": {},
+        "when": "always"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call can_send_mms with no arguments.",
+      "This is read-only; never apply a fix here."
+    ],
+    "parse_rules": [
+      "The result is exactly one of two sentences: 'Your messaging app cannot send MMS messages.' or 'Your messaging app can send MMS messages.'.",
+      "If the sentence contains 'cannot' (or 'not'), set task_state.can_send_mms=false and do NOT set resolved. This is the unresolved case — a fix subtask will run next.",
+      "ONLY if the sentence says 'can send' with NO 'cannot'/'not', set task_state.can_send_mms=true and resolved=true."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.can_send_mms"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.can_send_mms != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.can_send_mms\",\"value\":false} ] }"
+  },
+  "FIX_NETWORK_MODE_MMS": {
+    "goal_template": "set the network mode to include 3G+ (5G-preferred), then retest MMS",
+    "reads": [
+      "network_mode"
+    ],
+    "on_enter_reset": [
+      "can_send_mms"
+    ],
+    "retest_guard": {
+      "when": "task_state.network_mode == '4g_5g_preferred'",
+      "restrict_to": [
+        "can_send_mms"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "set_network_mode_preference",
+        "args": {
+          "mode": "4g_5g_preferred"
+        },
+        "when": "task_state.network_mode != '4g_5g_preferred'"
+      },
+      {
+        "tool": "can_send_mms",
+        "args": {},
+        "when": "the network mode was just set to 4g_5g_preferred"
+      }
+    ],
+    "executor_sys_rules": [
+      "MMS requires at least 3G. Call set_network_mode_preference with mode='4g_5g_preferred' if the current mode is 2G-only (or otherwise limiting).",
+      "After the mode is set, call can_send_mms to retest."
+    ],
+    "parse_rules": [
+      "After 'Preferred Network Mode set to: 4g_5g_preferred' set task_state.network_mode='4g_5g_preferred'.",
+      "Read the can_send_mms result carefully: if it contains 'cannot' or 'not', set task_state.can_send_mms=false and do NOT set resolved. ONLY if it says the app 'can send' with NO 'cannot'/'not' anywhere, set can_send_mms=true and resolved=true."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.network_mode"
+        },
+        {
+          "op": "set",
+          "path": "task_state.can_send_mms"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.network_mode == '4g_5g_preferred'",
+      "task_state.can_send_mms != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.network_mode\",\"value\":\"4g_5g_preferred\"}, {\"op\":\"set\",\"path\":\"task_state.can_send_mms\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "CHECK_WIFI_CALLING": {
+    "goal_template": "check whether Wi-Fi Calling is ON (it can interfere with MMS)",
+    "reads": [],
+    "base_actions": [
+      {
+        "tool": "check_wifi_calling_status",
+        "args": {},
+        "when": "always"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call check_wifi_calling_status with no arguments.",
+      "Read-only; never apply a fix here."
+    ],
+    "parse_rules": [
+      "From 'Wi-Fi Calling is currently turned ON/OFF' set task_state.wifi_calling_on (ON->true, OFF->false)."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.wifi_calling_on"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.wifi_calling_on != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.wifi_calling_on\",\"value\":true} ] }"
+  },
+  "FIX_WIFI_CALLING": {
+    "goal_template": "turn Wi-Fi Calling OFF, then retest MMS",
+    "reads": [
+      "wifi_calling_on"
+    ],
+    "on_enter_reset": [
+      "can_send_mms"
+    ],
+    "retest_guard": {
+      "when": "task_state.wifi_calling_on == false",
+      "restrict_to": [
+        "can_send_mms"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "toggle_wifi_calling",
+        "args": {},
+        "when": "task_state.wifi_calling_on == true"
+      },
+      {
+        "tool": "can_send_mms",
+        "args": {},
+        "when": "Wi-Fi Calling was just turned OFF"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call toggle_wifi_calling ONLY if task_state.wifi_calling_on is true (it flips state; call at most once).",
+      "After Wi-Fi Calling is OFF, call can_send_mms to retest."
+    ],
+    "parse_rules": [
+      "On 'Wi-Fi Calling is now OFF.' set task_state.wifi_calling_on=false.",
+      "Read the can_send_mms result carefully: if it contains 'cannot' or 'not', set task_state.can_send_mms=false and do NOT set resolved. ONLY if it says the app 'can send' with NO 'cannot'/'not' anywhere, set can_send_mms=true and resolved=true."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.wifi_calling_on"
+        },
+        {
+          "op": "set",
+          "path": "task_state.can_send_mms"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.wifi_calling_on == false",
+      "task_state.can_send_mms != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.wifi_calling_on\",\"value\":false}, {\"op\":\"set\",\"path\":\"task_state.can_send_mms\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "CHECK_MMS_PERMS": {
+    "goal_template": "check the messaging app's storage and sms permissions",
+    "reads": [],
+    "base_actions": [
+      {
+        "tool": "check_app_permissions",
+        "args": {
+          "app_name": "messaging"
+        },
+        "when": "always"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call check_app_permissions with app_name='messaging'.",
+      "Read-only; never apply a fix here."
+    ],
+    "parse_rules": [
+      "The result lists granted permissions, e.g. 'App ... has permission for: storage, sms.' or 'has no permissions granted.'.",
+      "Set task_state.mms_storage_perm = true if 'storage' is listed, else false.",
+      "Set task_state.mms_sms_perm = true if 'sms' is listed, else false."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.mms_storage_perm"
+        },
+        {
+          "op": "set",
+          "path": "task_state.mms_sms_perm"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.mms_storage_perm != null",
+      "task_state.mms_sms_perm != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.mms_storage_perm\",\"value\":false}, {\"op\":\"set\",\"path\":\"task_state.mms_sms_perm\",\"value\":true} ] }"
+  },
+  "FIX_STORAGE_PERM": {
+    "goal_template": "grant the messaging app the storage permission, then retest MMS",
+    "reads": [
+      "mms_storage_perm"
+    ],
+    "on_enter_reset": [
+      "can_send_mms"
+    ],
+    "retest_guard": {
+      "when": "task_state.mms_storage_perm == true",
+      "restrict_to": [
+        "can_send_mms"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "grant_app_permission",
+        "args": {
+          "app_name": "messaging",
+          "permission": "storage"
+        },
+        "when": "task_state.mms_storage_perm == false"
+      },
+      {
+        "tool": "can_send_mms",
+        "args": {},
+        "when": "the storage permission was just granted"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call grant_app_permission with app_name='messaging', permission='storage' (only this permission in this subtask).",
+      "After it is granted, call can_send_mms to retest."
+    ],
+    "parse_rules": [
+      "After \"Permission 'storage' granted\" set task_state.mms_storage_perm=true.",
+      "Read the can_send_mms result carefully: if it contains 'cannot' or 'not', set task_state.can_send_mms=false and do NOT set resolved. ONLY if it says the app 'can send' with NO 'cannot'/'not' anywhere, set can_send_mms=true and resolved=true."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.mms_storage_perm"
+        },
+        {
+          "op": "set",
+          "path": "task_state.can_send_mms"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.mms_storage_perm == true",
+      "task_state.can_send_mms != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.mms_storage_perm\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.can_send_mms\",\"value\":false} ] }"
+  },
+  "FIX_SMS_PERM": {
+    "goal_template": "grant the messaging app the sms permission, then retest MMS",
+    "reads": [
+      "mms_sms_perm"
+    ],
+    "on_enter_reset": [
+      "can_send_mms"
+    ],
+    "retest_guard": {
+      "when": "task_state.mms_sms_perm == true",
+      "restrict_to": [
+        "can_send_mms"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "grant_app_permission",
+        "args": {
+          "app_name": "messaging",
+          "permission": "sms"
+        },
+        "when": "task_state.mms_sms_perm == false"
+      },
+      {
+        "tool": "can_send_mms",
+        "args": {},
+        "when": "the sms permission was just granted"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call grant_app_permission with app_name='messaging', permission='sms' (only this permission in this subtask).",
+      "After it is granted, call can_send_mms to retest."
+    ],
+    "parse_rules": [
+      "After \"Permission 'sms' granted\" set task_state.mms_sms_perm=true.",
+      "Read the can_send_mms result carefully: if it contains 'cannot' or 'not', set task_state.can_send_mms=false and do NOT set resolved. ONLY if it says the app 'can send' with NO 'cannot'/'not' anywhere, set can_send_mms=true and resolved=true."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.mms_sms_perm"
+        },
+        {
+          "op": "set",
+          "path": "task_state.can_send_mms"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.mms_sms_perm == true",
+      "task_state.can_send_mms != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.mms_sms_perm\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.can_send_mms\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "CHECK_APN_MMS": {
+    "goal_template": "check whether the APN's MMSC URL is configured",
+    "reads": [],
+    "base_actions": [
+      {
+        "tool": "check_apn_settings",
+        "args": {},
+        "when": "always"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call check_apn_settings with no arguments.",
+      "Read-only; never apply a fix here."
+    ],
+    "parse_rules": [
+      "From 'MMSC URL (for picture messages): <v>' set task_state.mmsc_url_present = false if it is 'Not Set' (empty), otherwise true."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.mmsc_url_present"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.mmsc_url_present != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.mmsc_url_present\",\"value\":false} ] }"
+  },
+  "RESET_APN_MMS": {
+    "goal_template": "reset APN settings to restore the default MMSC URL (applies on reboot)",
+    "reads": [
+      "mmsc_url_present"
+    ],
+    "base_actions": [
+      {
+        "tool": "reset_apn_settings",
+        "args": {},
+        "when": "task_state.mmsc_url_present == false"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call reset_apn_settings with no arguments. This restores the default APN (and its MMSC URL); it applies on the next reboot. Call it exactly once."
+    ],
+    "parse_rules": [
+      "After 'APN settings will reset at reboot.' set task_state.mmsc_url_present=true."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.mmsc_url_present"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.mmsc_url_present == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.mmsc_url_present\",\"value\":true} ] }"
+  },
+  "REBOOT_MMS": {
+    "goal_template": "reboot the device so the APN reset takes effect",
+    "reads": [],
+    "on_enter_reset": [
+      "can_send_mms"
+    ],
+    "base_actions": [
+      {
+        "tool": "reboot_device",
+        "args": {},
+        "when": "task_state.apn_rebooted != true"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call reboot_device with no arguments so the APN reset is applied. Call it exactly once."
+    ],
+    "parse_rules": [
+      "After the reboot output ('Restarting network services...') set task_state.apn_rebooted=true."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.apn_rebooted"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.apn_rebooted == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.apn_rebooted\",\"value\":true} ] }"
+  },
+  "RETEST_MMS": {
+    "goal_template": "retest whether MMS can be sent after the APN reset + reboot",
+    "reads": [],
+    "base_actions": [
+      {
+        "tool": "can_send_mms",
+        "args": {},
+        "when": "always"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call can_send_mms with no arguments to check whether MMS works now."
+    ],
+    "parse_rules": [
+      "Read the can_send_mms result: if it contains 'cannot' or 'not', set task_state.can_send_mms=false and do NOT set resolved. ONLY if it says the app 'can send' with NO 'cannot'/'not', set can_send_mms=true and resolved=true."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.can_send_mms"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.can_send_mms != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.can_send_mms\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "ESCALATE": {
+    "goal_template": "transfer to a human agent when the workflow is exhausted or the issue cannot be fixed by the agent",
+    "reads": [
+      "customer_name",
+      "phone_number"
+    ],
+    "base_actions": [
+      {
+        "tool": "transfer_to_human_agents",
+        "args": {
+          "summary": "<one-line summary of steps tried and the remaining issue>"
+        },
+        "when": "task_state.resolved == false and no remaining applicable fix"
+      }
+    ],
+    "executor_sys_rules": [
+      "Escalate only when no remaining applicable fix exists (e.g. a SIM locked with PIN/PUK, or a line whose contract has ended, or all relevant steps tried without success).",
+      "Provide a concise summary of what was checked and changed."
+    ],
+    "parse_rules": [
+      "After 'Transfer successful' set task_state.escalated=true; this ends the workflow."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.escalated"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.escalated == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.escalated\",\"value\":true} ] }"
+  },
+  "VERIFY_SERVICE": {
+    "goal_template": "final check: confirm cellular service is restored",
+    "reads": [],
+    "base_actions": [
+      {
+        "tool": "check_network_status",
+        "args": {},
+        "when": "always"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call check_network_status once to confirm the final service state."
+    ],
+    "parse_rules": [
+      "From 'Cellular Connection: <v>' set task_state.service_status; if it is 'connected' set task_state.resolved=true."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.service_status"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.service_status != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.service_status\",\"value\":\"connected\"}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "VERIFY_SPEED": {
+    "goal_template": "final check: confirm mobile data speed is excellent",
+    "reads": [],
+    "base_actions": [
+      {
+        "tool": "run_speed_test",
+        "args": {},
+        "when": "always"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call run_speed_test once to confirm the final data speed."
+    ],
+    "parse_rules": [
+      "Read the run_speed_test result: 'Speed Test Result: <n> Mbps (<Desc>).' -> set speed_test to the <Desc> word (lowercased), data_available=true, and resolved=true ONLY if <Desc> is Excellent; 'Speed test failed: No Connection.' -> speed_test='no connection', data_available=false, resolved stays false."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.speed_test"
+        },
+        {
+          "op": "set",
+          "path": "task_state.data_available"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.speed_test != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.speed_test\",\"value\":\"excellent\"}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "VERIFY_MMS": {
+    "goal_template": "final check: confirm an MMS message can be sent",
+    "reads": [],
+    "base_actions": [
+      {
+        "tool": "can_send_mms",
+        "args": {},
+        "when": "always"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call can_send_mms once to confirm the final MMS state."
+    ],
+    "parse_rules": [
+      "Read the can_send_mms result: if it contains 'cannot' or 'not', set can_send_mms=false (resolved stays false); ONLY if it says the app 'can send' with NO 'cannot'/'not', set can_send_mms=true and resolved=true."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.can_send_mms"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.can_send_mms != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.can_send_mms\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  }
+}

@@ -267,9 +267,24 @@ class UserSimulator(
 
 
 class DummyUser(UserSimulator):
-    """A dummy user to run a agent solo simulation."""
+    """A dummy user to run a agent solo simulation.
 
-    def __init__(self):
+    ``build_user`` (runner/build.py) constructs every user with
+    ``tools/instructions/llm/llm_args`` (and ``persona_config`` for simulators).
+    DummyUser ignores them all — but it must still *accept* them, otherwise the
+    documented ``--user dummy_user`` solo command raises a TypeError. Tolerate and
+    drop the kwargs; the user is a no-op regardless.
+    """
+
+    def __init__(
+        self,
+        tools=None,
+        instructions=None,
+        llm=None,
+        llm_args=None,
+        persona_config=None,
+        **kwargs,
+    ):
         super().__init__(llm="dummy")
 
     def get_init_state(
