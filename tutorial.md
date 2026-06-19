@@ -5,7 +5,7 @@
 ```bash
 bash scripts/start_2gpu_server.sh --list-models        # 看可用模型
 export CUDA_VISIBLE_DEVICES=5,6
-bash scripts/start_2gpu_server.sh --model qwen3-8b     # 起服务 (默认开 prefix caching)
+bash scripts/start_2gpu_server.sh --model qwen3-8b  --port 7000   # 起服务 (默认开 prefix caching)
 ```
 
 ## 2. 跑 SchemaFlex（本地 8B）
@@ -15,7 +15,7 @@ bash scripts/start_2gpu_server.sh --model qwen3-8b     # 起服务 (默认开 pr
 ```bash
 cd /root/Project/SchemaFlex/tau2-bench
 NUM_TRIALS=4 \
-scripts/run.sh telecom_full_0615 --task-set-name telecom_full  --max-concurrency 4
+scripts/run.sh GPT_GenSchema --task-set-name telecom_full  --max-concurrency 4
 ```
 
 **常用参数**

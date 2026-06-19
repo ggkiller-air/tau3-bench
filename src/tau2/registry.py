@@ -14,7 +14,14 @@ from tau2.agent.llm_agent import (
     create_llm_gt_agent,
     create_llm_solo_agent,
 )
-from tau2.agent.schema_agent import create_schema_solo_agent
+from tau2.agent.schema_agent import (
+    create_llm_solo_agent_sanitized,
+    create_schema_solo_agent,
+)
+from tau2.agent.schema_user_agent import (
+    SchemaUserAgent,
+    create_schema_user_agent,
+)
 from tau2.data_model.tasks import Task
 from tau2.domains.airline.environment import (
     get_environment as airline_domain_get_environment,
@@ -50,6 +57,9 @@ from tau2.domains.telecom.environment import (
 )
 from tau2.domains.telecom.environment import (
     get_tasks_small as telecom_domain_get_tasks_small,
+)
+from tau2.domains.telecom.environment import (
+    get_tasks_strat90 as telecom_domain_get_tasks_strat90,
 )
 from tau2.domains.telecom.environment import (
     get_tasks_split as telecom_domain_get_tasks_split,
@@ -314,6 +324,17 @@ try:
         metadata={"solo_mode": True},
     )
     registry.register_agent_factory(
+        create_llm_solo_agent_sanitized,
+        "llm_agent_solo_sanitized",
+        task_filter=LLMSoloAgent.check_valid_task,
+        metadata={"solo_mode": True},
+    )
+    registry.register_agent_factory(
+        create_schema_user_agent,
+        "schema_user_agent",
+        task_filter=SchemaUserAgent.check_valid_task,
+    )
+    registry.register_agent_factory(
         create_discrete_time_audio_native_agent,
         "discrete_time_audio_native_agent",
     )
@@ -340,6 +361,7 @@ try:
     )
     registry.register_tasks(telecom_domain_get_tasks_full, "telecom_full")
     registry.register_tasks(telecom_domain_get_tasks_small, "telecom_small")
+    registry.register_tasks(telecom_domain_get_tasks_strat90, "telecom_strat90")
     registry.register_tasks(
         telecom_domain_get_tasks,
         "telecom",

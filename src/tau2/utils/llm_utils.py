@@ -400,6 +400,11 @@ def generate(
     validate_message_history(messages)
     if kwargs.get("num_retries") is None:
         kwargs["num_retries"] = DEFAULT_MAX_RETRIES
+    # Bound every LLM call so one hung request can't wedge a whole dialogue
+    # task indefinitely (observed: user-sim completions held open with no
+    # timeout → tasks stuck 20min at 0% GPU). Per-attempt; configurable.
+    if kwargs.get("timeout") is None:
+        kwargs["timeout"] = float(os.environ.get("TAU2_LLM_TIMEOUT", "60"))
 
     # Vertex AI Gemini 3 models require VERTEXAI_LOCATION="global"
     if model.startswith("vertex_ai/gemini-3") and not os.environ.get(

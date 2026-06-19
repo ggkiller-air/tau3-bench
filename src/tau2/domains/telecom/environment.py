@@ -13,6 +13,7 @@ from tau2.domains.telecom.utils import (
     TELECOM_MAIN_POLICY_PATH,
     TELECOM_MAIN_POLICY_SOLO_PATH,
     TELECOM_TASK_SET_PATH,
+    TELECOM_TASK_SET_PATH_STRAT90,
     TELECOM_TECH_SUPPORT_POLICY_MANUAL_PATH,
     TELECOM_TECH_SUPPORT_POLICY_MANUAL_SOLO_PATH,
     TELECOM_TECH_SUPPORT_POLICY_WORKFLOW_PATH,
@@ -194,6 +195,11 @@ def get_tasks_full(task_split_name: Optional[str] = None) -> list[Task]:
 
 def get_tasks_small(task_split_name: Optional[str] = None) -> list[Task]:
     return get_tasks("small")
+
+
+def get_tasks_strat90(task_split_name: Optional[str] = None) -> list[Task]:
+    """Stratified 90-task eval subset (self-contained file, not a master split)."""
+    return load_tasks(TELECOM_TASK_SET_PATH_STRAT90)
 
 
 if __name__ == "__main__":

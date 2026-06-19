@@ -130,6 +130,18 @@ def _eval_atom(atom: str, ts: dict) -> bool:
             lhs, rhs = atom.split(op, 1)
             lval = ts.get(_field(lhs))
             rval = _literal(rhs)
+            # The 8B intermittently stores booleans/nulls as quoted strings
+            # ("true"/"false"/"null"), so a `== true` guard or done_when_all atom
+            # would silently never match. Normalize the stored side when comparing
+            # against a non-string literal (generic; not task-specific).
+            if isinstance(lval, str) and not isinstance(rval, str):
+                _low = lval.strip().lower()
+                if _low == "true":
+                    lval = True
+                elif _low == "false":
+                    lval = False
+                elif _low in ("null", "none"):
+                    lval = None
             return (lval == rval) if op == "==" else (lval != rval)
     # bare field => truthiness
     return bool(ts.get(_field(atom)))
@@ -220,6 +232,14 @@ def _apply_patch_ops(ts: dict, ops: list, allowed, enums=None) -> list:
         if ("set", path) not in allowed_pairs:
             continue
         val = op["value"]
+        if isinstance(val, str):  # the 8B often quotes booleans/nulls -> store real types
+            _low = val.strip().lower()
+            if _low == "true":
+                val = True
+            elif _low == "false":
+                val = False
+            elif _low in ("null", "none"):
+                val = None
         allowed_vals = enums.get(path)
         if allowed_vals is not None and val is not None and val not in allowed_vals:
             logger.debug(f"[patch_ops] dropped off-enum {path}={val!r} (allowed: {allowed_vals})")
@@ -868,6 +888,48 @@ class SchemaSoloAgent(LLMSoloAgent):
 
 def create_schema_solo_agent(tools, domain_policy, **kwargs):
     return SchemaSoloAgent(
+        tools=tools,
+        domain_policy=domain_policy,
+        llm=kwargs.get("llm"),
+        llm_args=kwargs.get("llm_args"),
+        task=kwargs.get("task"),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Bare solo BASELINE with tool-schema parity (NO schema control layer)
+# --------------------------------------------------------------------------- #
+# The reference LLMSoloAgent feeds RAW tool schemas to the model. On local
+# qwen3-8b vLLM, Union[Enum,str] params (anyOf/$ref/$defs) make the tool-caller
+# emit empty args -> litellm BadRequest -> the whole task dies with
+# infrastructure_error (verified: 25/25 bare-solo sims died before the 1st call).
+# SchemaSoloAgent dodges this via _SanitizedTool. For a FAIR no-schema baseline
+# (the horizon-curve control vs schema_solo_agent) the bare agent needs the SAME
+# sanitization — pure tool *callability* parity, NOT a schema/state control layer:
+# the env still runs the real tool; only the schema shown to the model is flattened.
+
+
+class SanitizedLLMSoloAgent(LLMSoloAgent):
+    """LLMSoloAgent + tool-schema sanitization, nothing else.
+
+    The bare ReAct-solo baseline that can actually call the telecom tools on a
+    qwen tool-parser. No guarded walk, no task_state, no patch_ops — just the
+    stock solo agent with model-friendly tool schemas. This is the control arm
+    for the long-horizon (success-vs-fault-depth) comparison.
+    """
+
+    def __init__(self, tools, domain_policy, task, llm, llm_args=None):
+        super().__init__(
+            tools=tools, domain_policy=domain_policy, task=task, llm=llm, llm_args=llm_args
+        )
+        # super().__init__ already ran add_stop_tool() + validate_tools() on the
+        # real tools; generate() downstream reads only .name / .openai_schema, so
+        # wrapping every tool in the schema-only view here is safe.
+        self.tools = [_SanitizedTool(t) for t in self.tools]
+
+
+def create_llm_solo_agent_sanitized(tools, domain_policy, **kwargs):
+    return SanitizedLLMSoloAgent(
         tools=tools,
         domain_policy=domain_policy,
         llm=kwargs.get("llm"),

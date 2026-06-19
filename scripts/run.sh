@@ -16,11 +16,12 @@ cd "$(dirname "$0")/.."
 RUN="${1:?usage: scripts/run.sh <run-name> [extra tau2 run args...]}"; shift || true
 DIR="data/simulations/$RUN"; mkdir -p "$DIR"
 AGENT_LLM="${AGENT_LLM:-openai/qwen3-8b}"
+AGENT="${AGENT:-schema_solo_agent}"   # override e.g. AGENT=llm_agent_solo for the bare-solo baseline
 MAX_STEPS="${MAX_STEPS:-100}"
 NUM_TRIALS="${NUM_TRIALS:-1}"   # set 4 for pass^4
 ENV_FILE="${ENV_FILE:-}"
 
-common=(--domain telecom --agent schema_solo_agent --user dummy_user
+common=(--domain telecom --agent "$AGENT" --user dummy_user
         --agent-llm "$AGENT_LLM" --num-trials "$NUM_TRIALS" --max-steps "$MAX_STEPS"
         --save-to "$RUN")
 
@@ -31,7 +32,7 @@ if [ -n "$ENV_FILE" ]; then
   echo '{"queries":0,"hits":0}' > "$DIR/cache.json"
 else
   # Local vLLM mode: inject base/key + snapshot prefix-cache hit delta.
-  BASE="${OPENAI_API_BASE:-http://127.0.0.1:8000/v1}"
+  BASE="${OPENAI_API_BASE:-http://127.0.0.1:9000/v1}"
   METRICS="${VLLM_METRICS:-${BASE%/v1}/metrics}"
   snap(){ curl -s "$METRICS" 2>/dev/null | awk '/gpu_prefix_cache_queries_total/{q=$2}/gpu_prefix_cache_hits_total/{h=$2}END{print q+0,h+0}'; }
   read q0 h0 < <(snap)

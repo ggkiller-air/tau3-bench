@@ -20,6 +20,9 @@ TELECOM_TECH_SUPPORT_POLICY_WORKFLOW_SOLO_PATH = (
 # TELECOM_TASK_SET_PATH_FULL = TELECOM_DATA_DIR / "tasks_full.json" # Not used anymore. Use full task split instead
 # TELECOM_TASK_SET_PATH_SMALL = TELECOM_DATA_DIR / "tasks_small.json" # Not used anymore. Use small task split instead
 TELECOM_TASK_SET_PATH = TELECOM_DATA_DIR / "tasks.json"
+# strat90: a stratified 90-task eval subset (30 per family, fault depth 1-8), extracted from the
+# strat90_v2 8B run. Self-contained file (same 6-key schema as the master), not a split.
+TELECOM_TASK_SET_PATH_STRAT90 = TELECOM_DATA_DIR / "tasks_strat90.json"
 
 
 def get_now() -> datetime:
