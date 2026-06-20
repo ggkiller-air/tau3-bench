@@ -171,6 +171,30 @@ _SUPERVISOR_ON = os.environ.get("SCHEMAFLEX_SUPERVISOR", "") not in ("", "0", "f
 _SUPERVISOR_LLM = os.environ.get("SCHEMAFLEX_SUPERVISOR_LLM", "openai/gpt-5.4")
 _SUPERVISOR_MAX = int(os.environ.get("SCHEMAFLEX_SUPERVISOR_MAX", "4"))
 
+# --------------------------------------------------------------------------- #
+# REPLAN: dynamic, state-aware subtask RE-RANKER (training-free orchestration).
+# The static walk (_active_subtask) follows base_subtask_sequence positionally,
+# which forces the agent through unanswerable read-only diagnostics before the
+# repair→retest→resolved chain — burning the step budget (max_steps) on the
+# hardest families. REPLAN re-orders the eligible candidates by a CAUSAL key:
+# "is this subtask on the produces/consumes chain toward `resolved`?". On-chain
+# repairs/retests are pulled forward; off-chain pure-read diagnostics are
+# down-weighted and abandoned faster — never a state-writing repair (which is
+# always kept). All gated by SCHEMAFLEX_REPLAN; off → byte-identical positional
+# walk (clean A/B). Independent of and composable with SAGE / SUPERVISOR.
+# --------------------------------------------------------------------------- #
+_REPLAN_ON = os.environ.get("SCHEMAFLEX_REPLAN", "") not in ("", "0", "false", "False")
+# A subtask WRITES backend/device state (a "repair") if its subtask_type carries
+# a fix-prefix OR any base_action tool mutates. Classify pure-read diagnostics
+# (only get_/check_/run_speed_test/can_send_mms) as skippable; anything else is
+# treated as a repair (never skipped) — uncertainty resolves to "do not skip".
+_REPAIR_PREFIX_RE = re.compile(r"^(FIX_|RESET_|RESUME_|MAKE_|REQUEST_|REBOOT_)")
+_MUT_TOOL_RE = re.compile(
+    r"^(toggle_|enable_|disable_|set_|make_|reset_|reseat_|unseat_|lock_|unlock_|"
+    r"refuel_|grant_|revoke_|disconnect_|resume_|reboot_|send_payment|pay_)"
+)
+_READONLY_TOOL_RE = re.compile(r"^(get_|check_|run_speed_test|can_send_mms)")
+
 _SUPERVISOR_SYSTEM = """You are a DYNAMIC SCHEDULER supervising a small-model agent troubleshooting with a live customer. The agent normally follows a FIXED schema sequence of subtasks, but it is now DEADLOCKED — stuck repeating one step. Each subtask is an action PRIMITIVE with a goal and a completion condition. You are NOT bound by the fixed sequence: based on the current machine state, pick the single best next move to break the deadlock.
 
 Choose exactly one decision:
@@ -372,6 +396,13 @@ class SchemaUserAgent(SchemaSoloAgent):
         give up here. SAGE off: original "consecutive no-progress ≥ 3".
         """
         stype = subtask["subtask_type"]
+        # REPLAN fast-abandon: a provably off-chain, read-only diagnostic is not
+        # worth even one more ask while on-chain work still pends. Double-guarded
+        # inside _replan_offchain so a state-writing repair can NEVER reach here.
+        if _REPLAN_ON and self._replan_offchain(state, subtask):
+            _state_log({"kind": "replan_skip", "task_id": tid, "subtask": subtask["name"],
+                        "reason": "off_chain_diag", "task_state": dict(state.task_state)})
+            return True
         if not _SAGE_ON:
             return state.stuck.get(subtask["name"], 0) >= 3
         unfilled = [f for f in self._dwa_fields(stype) if state.task_state.get(f) is None]
@@ -393,6 +424,230 @@ class SchemaUserAgent(SchemaSoloAgent):
                         "details": details, "task_state": dict(state.task_state)})
             return True
         return False
+
+    # -- REPLAN: causal-chain dynamic subtask re-ranker ------------------ #
+    def _active_subtask(self, state):  # type: ignore[override]
+        """User-mode subtask selector. OFF → parent positional walk (byte-identical)."""
+        if not _REPLAN_ON:
+            return super()._active_subtask(state)
+        return self._active_subtask_replan(state)
+
+    def _subtask_tools(self, subtask_type):
+        spec = self.subtask_spec.get(subtask_type, {}) or {}
+        return [str(ba.get("tool", "")) for ba in spec.get("base_actions", []) or []]
+
+    def _is_repair(self, subtask):
+        """True if the subtask writes backend/device state. Uncertain → True (never skip)."""
+        stype = subtask["subtask_type"]
+        if _REPAIR_PREFIX_RE.match(stype):
+            return True
+        return any(_MUT_TOOL_RE.match(t) for t in self._subtask_tools(stype))
+
+    def _is_readonly(self, subtask):
+        """True only if EVERY base_action tool is provably read-only (safe to skip)."""
+        tools = self._subtask_tools(subtask["subtask_type"])
+        return bool(tools) and all(_READONLY_TOOL_RE.match(t) for t in tools)
+
+    def _pred_fields(self, pred):
+        """task_state field names referenced by a predicate string or list."""
+        out = []
+        for p in (pred if isinstance(pred, list) else [pred]):
+            for m in _DWA_FIELD_RE.findall(str(p or "")):
+                if m not in out:
+                    out.append(m)
+        return out
+
+    def _produces(self, subtask_type):
+        """task_state fields a subtask can write = allowed 'set' paths ∪ parse_rule targets."""
+        spec = self.subtask_spec.get(subtask_type, {}) or {}
+        allowed = (spec.get("patch_ops_policy", {}) or {}).get("allowed", []) or []
+        fields = {_field(str(a.get("path", ""))) for a in allowed
+                  if isinstance(a, dict) and a.get("op") == "set"}
+        for r in spec.get("parse_rules", []) or []:
+            fields.update(_DWA_FIELD_RE.findall(str(r)))
+        fields.discard("")
+        return fields
+
+    def _consumes(self, subtask):
+        """task_state fields referenced by a subtask's entry `when` + base_action `when`s."""
+        flds = set(self._pred_fields(subtask.get("when", "always")))
+        spec = self.subtask_spec.get(subtask["subtask_type"], {}) or {}
+        for ba in spec.get("base_actions", []) or []:
+            flds.update(self._pred_fields(ba.get("when", "always")))
+        flds.discard("")
+        return flds
+
+    def _causal_index(self, state):
+        """Static per-family causal index (goal_fields/produces/is_repair/order). Cached."""
+        cache = getattr(self, "_replan_cache", None)
+        if cache is None:
+            cache = self._replan_cache = {}
+        fam = state.family
+        if fam not in cache:
+            fam_spec = self._family_spec(state)
+            seq = fam_spec["base_subtask_sequence"]
+            goal = set(self._pred_fields(fam_spec.get("success_when_all", [])))
+            goal.add("resolved")  # universal gate; produced only by retest/verify
+            cache[fam] = {
+                "goal_fields": goal,
+                "produces": {st["subtask_type"]: self._produces(st["subtask_type"]) for st in seq},
+                "is_repair": {st["subtask_type"]: self._is_repair(st) for st in seq},
+                "order": {st["name"]: i for i, st in enumerate(seq)},
+            }
+        return cache[fam]
+
+    def _atom_live(self, atom, ts):
+        """An atom is 'live' if its field is still UNKNOWN (could be satisfied) or,
+        if KNOWN, actually holds. Falsified-by-known-field ⇒ dead."""
+        f = _field(atom.split("==")[0].split("!=")[0])
+        if ts.get(f) is None:
+            return True
+        return eval_pred(atom, ts)
+
+    def _when_live(self, when, ts):
+        """A `when` is live if some OR-group has no atom falsified by a KNOWN field.
+        Used to prune branches the current state has already ruled out (e.g. the
+        billing/suspension subtree once service_status is known 'connected')."""
+        pred = (when or "always").strip()
+        if pred in ("", "always"):
+            return True
+        if pred == "never":
+            return False
+        for grp in pred.split(" or "):
+            if all(self._atom_live(a, ts) for a in grp.split(" and ")):
+                return True
+        return False
+
+    def _needed_fields(self, state, idx):
+        """Fields on the path to the goal: goal ∪ consumes of LIVE pending repairs/
+        retests, transitively closed through LIVE producers. Dead branches (a repair
+        whose `when` is falsified by known state) contribute nothing."""
+        ts = state.task_state
+        seq = self._family_spec(state)["base_subtask_sequence"]
+        pending = [st for st in seq
+                   if not state.subtask_done.get(st["name"])
+                   and self._when_live(st.get("when", "always"), ts)]
+        goal = idx["goal_fields"]
+        needed = set(goal)
+        for st in pending:
+            t = st["subtask_type"]
+            if idx["is_repair"][t] or (idx["produces"][t] & goal):
+                needed |= self._consumes(st)
+        changed = True
+        while changed:
+            changed = False
+            for st in pending:
+                if idx["produces"][st["subtask_type"]] & needed:
+                    c = self._consumes(st)
+                    if not c <= needed:
+                        needed |= c
+                        changed = True
+        return needed
+
+    def _on_chain(self, idx, needed, subtask):
+        """Membership: a candidate is on the causal chain if it is a repair/retest, or
+        it produces a field needed by a LIVE pending repair/retest toward the goal."""
+        t = subtask["subtask_type"]
+        prod = idx["produces"][t]
+        return idx["is_repair"][t] or bool(prod & idx["goal_fields"]) or bool(prod & needed)
+
+    def _informative(self, state, idx, needed, subtask):
+        """A diagnostic is informative iff it can write a NEEDED field that is still
+        UNKNOWN — i.e. running it actually advances the causal chain (not a re-check)."""
+        ts = state.task_state
+        prod = idx["produces"][subtask["subtask_type"]]
+        return any(f in needed and ts.get(f) is None for f in prod)
+
+    def _any_repair_done(self, state, idx):
+        """A repair has run this episode (so a pending retest is worth pulling forward
+        to confirm/close). Prevents premature 'verify' before any fix is applied."""
+        return any(idx["is_repair"].get(st["subtask_type"], False)
+                   for st in self._family_spec(state)["base_subtask_sequence"]
+                   if state.subtask_done.get(st["name"]))
+
+    def _priority(self, state, idx, needed, subtask):
+        """4 tiers (high→low), tie-broken by original positional order (stable, so
+        ON==OFF absent a higher tier):
+          4  eligible REPAIR — apply the fix first.
+          3  retest/verify producing the family GOAL-CORE field, AND a repair has run
+             (the A1 close: confirm & set resolved with the right check).
+          2  informative on-chain diagnostic, or a post-repair retest that only
+             produces `resolved` (not the goal-core field).
+          1  off-chain, already-informed, OR a premature retest (no repair done yet)."""
+        t = subtask["subtask_type"]
+        prod = idx["produces"][t]
+        goal_core = idx["goal_fields"] - {"resolved"}  # the family's success field(s)
+        if idx["is_repair"][t]:
+            tier = 4  # eligible repair (candidate set is already when-filtered)
+        elif "resolved" in prod:  # pure retest/verify — the CLOSER (produces resolved).
+            # NOTE: key on `resolved`, NOT `prod & goal_fields` — a diagnostic like
+            # DIAGNOSE_DATA also produces a goal field (speed_test) but is not a closer.
+            if not self._any_repair_done(state, idx):
+                tier = 1  # premature: nothing fixed yet to confirm
+            elif prod & goal_core:
+                tier = 3  # the right closer for THIS family
+            else:
+                tier = 2  # a retest that can't confirm the family goal
+        elif self._informative(state, idx, needed, subtask):
+            tier = 2
+        else:
+            tier = 1
+        return (tier, -idx["order"][subtask["name"]])
+
+    def _replan_offchain(self, state, subtask):
+        """True iff REPLAN on and this subtask is a provably off-chain, read-only
+        diagnostic while on-chain work still pends — the ONLY thing REPLAN skips.
+        A state-writing repair can never satisfy this (double-guarded)."""
+        if not _REPLAN_ON or self._is_repair(subtask) or not self._is_readonly(subtask):
+            return False
+        idx = self._causal_index(state)
+        needed = self._needed_fields(state, idx)
+        if self._on_chain(idx, needed, subtask):
+            return False
+        seq = self._family_spec(state)["base_subtask_sequence"]
+        for st in seq:  # is there on-chain work still pending elsewhere?
+            if st["name"] == subtask["name"] or state.subtask_done.get(st["name"]):
+                continue
+            if self._on_chain(idx, needed, st):
+                return True
+        return False
+
+    def _active_subtask_replan(self, state):
+        """Causal-chain re-ranker (REPLAN on). Sticky-preserving; eligible set identical
+        to the parent walk; only the PICK ORDER among eligible candidates changes."""
+        # 1) stickiness — identical to parent: keep a started-but-not-done subtask.
+        if state.active_subtask and not state.subtask_done.get(state.active_subtask):
+            st = self._subtask_by_name(state, state.active_subtask)
+            if st is not None:
+                return st
+        ts = state.task_state
+        seq = self._family_spec(state)["base_subtask_sequence"]
+        eligible = [st for st in seq
+                    if not state.subtask_done.get(st["name"])
+                    and eval_pred(st.get("when", "always"), ts)]
+        if not eligible:
+            state.active_subtask = None
+            return None
+        idx = self._causal_index(state)
+        needed = self._needed_fields(state, idx)
+        best = max(eligible, key=lambda st: self._priority(state, idx, needed, st))
+        self._log_replan(state, idx, needed, eligible, best)
+        state.active_subtask = best["name"]
+        self._on_enter(best, state)
+        return best
+
+    def _log_replan(self, state, idx, needed, eligible, best):
+        cands = [{
+            "name": st["name"], "type": st["subtask_type"],
+            "tier": self._priority(state, idx, needed, st)[0],
+            "repair": idx["is_repair"][st["subtask_type"]],
+            "on_chain": self._on_chain(idx, needed, st),
+            "pos": idx["order"][st["name"]],
+        } for st in eligible]
+        _state_log({"kind": "replan", "task_id": getattr(self.task, "id", "?"),
+                    "chosen": best["name"], "chosen_type": best["subtask_type"],
+                    "goal_fields": sorted(idx["goal_fields"]),
+                    "candidates": cands, "task_state": dict(state.task_state)})
 
     def _sage_focus_hint(self, subtask_type, state) -> str:
         """On a re-ask of an unresolved enum aspect, surface the closed option
@@ -799,7 +1054,8 @@ class SchemaUserAgent(SchemaSoloAgent):
             # schema fails. Spend a SPARSE supervisor (big-model) call before
             # abandoning — it may recover within the schema's allowed actions
             # (re-extract missed info / rephrase) or decide to escalate.
-            if _SUPERVISOR_ON and state.supervisor_calls < _SUPERVISOR_MAX:
+            if (_SUPERVISOR_ON and state.supervisor_calls < _SUPERVISOR_MAX
+                    and not self._replan_offchain(state, subtask)):
                 act = self._supervise(subtask, state, tid)
                 if act is not None and act[0] == "extract":
                     self._mark_done_if_complete(
