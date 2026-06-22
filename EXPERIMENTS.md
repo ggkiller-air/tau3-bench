@@ -74,6 +74,58 @@ python analyze_tokens.py data/simulations/user_replan_ground_shotgun_full
 
 ---
 
+## Round 2（2026-06-22）：攻 overdue_bill_suspension（ELICIT 隔离 + 新 lever L-SEQ）
+
+**背景**：Round 1 确认 100 步下新最佳栈 = **B = REPLAN+CLOSE+GROUND**（pass^1=0.925 / pass^4=0.85），唯一残差 = `overdue_bill_suspension`（三臂全 0/4）。已 dump C 臂 4 个 trial 锁定**两层根因**（终局 task_state 实锤 `bill_paid=False, pay_allowed=True, line_suspended=True, service_status=no_service`，且工具序列止于 `check_payment_request`、`make_payment` 从没被调）：
+- **第一层**：`makePayment` 门控 `pay_allowed==true`，而 pay_allowed 只由 ticket 文本填、本任务授权藏在 task_instructions → 恒 null → makePayment 永不激活。**L-ELICIT 已解**（问用户 yes/no 填上）。
+- **第二层**：makePayment 内 `check_payment_request`(读) 的 when 含 `bill_paid != true`，跑完仍成立 → `_next_action` 循环选 check、选不到 `make_payment`（其 when 是散文「after…succeeded」恒 False）；且 check 的输出「You **have** a payment request」被 8B StateUpdater 幻觉解析成 `bill_paid=False` → done_when_all(`bill_paid != null`) 满足 → 子任务**提前 done**，make_payment 永不跑 → 转人工。**新 lever L-SEQ 修这一层**（编排层，`SCHEMAFLEX_SEQ`，OFF byte-identical）：① R-skip：`_next_action` 跳过本激活已 dispatch 的**非末位** action（末位保留可重试）→ check 跑完后选到 make_payment；② R-doneguard：`_mark_done_if_complete` 要求**末位 action 已 dispatch** 才判 done → 治 check 后提前 done。对单动作子任务、FIX_*（done 字段只由末位 retest 产出）数学 inert。
+
+**overdue 要过必须 ELICIT + SEQ 两个都在**（单独哪个都不够）。本轮还补 Round 1 的实验缺口：ELICIT 此前只在 B+SHOTGUN 上测过，从没在新最佳栈 B 上单独测。
+
+### 实验矩阵（全部 telecom_small / num-trials 4 / max_steps 100，脚本已配好）
+
+| 臂 | 栈 | 脚本 | 产物目录 |
+|---|---|---|---|
+| **B** | REPLAN+CLOSE+GROUND（基线，**已有数据**，无需重跑） | — | `user_replan_ground_full` |
+| **B+E** | B + ELICIT | `run_replan_ground_elicit_full.sh` | `user_replan_ground_elicit_full` |
+| **B+E+S** | B + ELICIT + SEQ（**修复臂**） | `run_replan_ground_elicit_seq_full.sh` | `user_replan_ground_elicit_seq_full` |
+
+> 串行跑 B+E、B+E+S（B 复用 Round 1 数据）。每个跑完先 `grep -c infrastructure_error <dir>/results.json`（≈0；非 0 记下数量、必要时重跑该臂）。
+
+### 每臂分析（跑完后）
+
+```bash
+# B+E vs B（隔离 ELICIT 净效应）
+python analyze_arm.py data/simulations/user_replan_ground_elicit_full data/simulations/user_replan_ground_full
+# B+E+S vs B+E（隔离 SEQ 净效应 = overdue 修复）
+python analyze_arm.py data/simulations/user_replan_ground_elicit_seq_full data/simulations/user_replan_ground_elicit_full
+# B+E+S vs B（总账）
+python analyze_arm.py data/simulations/user_replan_ground_elicit_seq_full data/simulations/user_replan_ground_full
+# elicit 触发计数（两臂都应只在 overdue 触发；若碰别的家族要记）
+grep -c '"kind": "elicit"' data/simulations/user_replan_ground_elicit_full/state_log.jsonl
+grep -c '"kind": "elicit"' data/simulations/user_replan_ground_elicit_seq_full/state_log.jsonl
+```
+
+### 要在报告里回答的问题
+
+1. **三臂 pass^1-4**（B 用 Round 1 数据：0.925/0.900/0.875/0.850）。
+2. **逐家族 pass^1**（service / mobile_data / mms）。
+3. **`overdue_bill_suspension` 4-trial 通过数**（B / B+E / B+E+S）——**核心**：B+E+S 是否 0/4 → 4/4？B+E 是否仍 0/4（验证 SEQ 是必要的第二层）？
+4. **L-SEQ 零回归核验**：B+E+S vs B+E 除 overdue 外是否有任何任务掉点？尤其 mms/mobile_data 的 FIX_* 任务（SEQ 理论上 inert，要实测确认）。逐任务列出 B+E→B+E+S 有变化的任务。
+5. **ELICIT 在 B 上的净效应**：B+E vs B 的 pass^1/pass^4 delta；elicit 触发是否只在 overdue（别碰 mobile_data/mms）。
+6. **若 B+E+S 的 overdue 仍 <4/4**：dump 失败 trial（`python dump_sim.py user_replan_ground_elicit_seq_full <sim_id>`），贴出 makePayment 之后的工具序列 + 终局 task_state 的 `bill_paid/line_suspended/service_status`，看卡在 make_payment / resume_line / reboot 哪一步。
+
+### 报告格式（写进 `EXPERIMENT_REPORT.md`，新开一节 `## Round 2 报告`）
+
+- 三臂 × pass^1-4 表 + 逐家族表。
+- `overdue_bill_suspension` 4-trial 通过数表（B/B+E/B+E+S）。
+- `analyze_arm` 的 DELTA 原文（B+E vs B、B+E+S vs B+E、B+E+S vs B）+ 两臂 elicit 触发计数。
+- B+E+S vs B+E 的逐任务 diff（确认 SEQ 零回归）。
+- 3-5 行结论：overdue 是否解决、SEQ 有无回归、ELICIT 在 B 上去留、新最佳栈是什么、建议下一步。
+- 任何异常如实记。
+
+---
+
 ## 历史轮次报告
 
 见 `EXPERIMENT_REPORT.md`。

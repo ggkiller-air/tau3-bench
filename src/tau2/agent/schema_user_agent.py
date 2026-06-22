@@ -306,6 +306,28 @@ _SHOTGUN_RETRY_CAP = 3
 # one mechanism. Gated by SCHEMAFLEX_ELICIT; OFF = byte-identical.
 _ELICIT_ON = os.environ.get("SCHEMAFLEX_ELICIT", "") not in ("", "0", "false", "False")
 
+# --------------------------------------------------------------------------- #
+# L-SEQ: ordered multi-action subtask sequencing guard.
+#
+# Motivating bug (overdue_bill_suspension, MAKE_PAYMENT = [check_payment_request,
+# make_payment]): the read action's `when` (... bill_paid != true) STAYS true after it
+# runs, so `_next_action` re-selects the read forever and the terminal write make_payment
+# (whose `when` is the prose "after check_payment_request succeeded", never eval-true) is
+# never reached. Worse, the StateUpdater can mis-parse the read's output into the done-field
+# (bill_paid=False from "You HAVE a payment request"), satisfying done_when_all (bill_paid !=
+# null) and closing the subtask before make_payment ever fires — chain dies, agent escalates.
+#
+# SEQ enforces the subtask's own stated contract ("call each at most once, in order"):
+#   R-skip      `_next_action` skips a NON-terminal base_action already dispatched this
+#               activation (the terminal is never skipped, so a balked retest stays
+#               re-instructable), so the read can't loop and the terminal gets selected.
+#   R-doneguard `_mark_done_if_complete` withholds completion of a multi-action subtask until
+#               its TERMINAL base_action has dispatched, so a hallucinated parse of a
+#               non-terminal read can't close it early. (Inert for FIX_*: their done-field is
+#               produced only by the terminal retest, so done_when_all ⟹ terminal dispatched.)
+# Gated by SCHEMAFLEX_SEQ; OFF = byte-identical.
+_SEQ_ON = os.environ.get("SCHEMAFLEX_SEQ", "") not in ("", "0", "false", "False")
+
 _ELICIT_SYSTEM = """You are a friendly telecom support agent. Before you can apply a fix, you need ONE piece of authorization or context from the customer that only they can give (e.g. permission to charge an overdue bill, or whether they are currently travelling abroad). Write ONE short, friendly yes/no question that obtains exactly that — name the concrete thing (the specific bill, the specific action). Do NOT explain steps or list options; just ask the single question. Output only the question text."""
 
 _ELICIT_USER = """You need the customer's: {field}
@@ -374,6 +396,7 @@ class SchemaUserAgentState(SchemaSoloAgentState):
     shotgun_idx: int = 0  # L-SHOTGUN: index of the next mms repair-plan step to fire
     shotgun_retry: int = 0  # L-SHOTGUN: re-instruct count for the current step (until it lands)
     elicited: list = []  # L-ELICIT: context-precondition fields already asked of the user
+    acted: dict = {}  # L-SEQ: subtask name -> base_action tools already dispatched this activation
 
 
 class SchemaUserAgent(SchemaSoloAgent):
@@ -441,6 +464,25 @@ class SchemaUserAgent(SchemaSoloAgent):
         bas = self.subtask_spec.get(subtask["subtask_type"], {}).get("base_actions", [])
         if not bas:
             return None
+        if _SEQ_ON:
+            # L-SEQ R-skip: skip a non-terminal base_action already dispatched this activation,
+            # so a READ-ONLY gate whose `when` stays true (e.g. check_payment_request: bill_paid
+            # != true — checking never sets bill_paid) can't loop and starve the terminal write.
+            # Restricted to read-only tools: a read lands deterministically on dispatch (the user
+            # just reports what they see), so at-most-once is safe. MUTATING device actions can
+            # balk (the user doesn't perform them) and MUST stay re-instructable — never skip
+            # them, or a balked flip is lost and the subtask loops on its retest forever
+            # (observed killing mms repairs in the unscoped version). The terminal action is also
+            # never skipped (a balked retest must remain re-instructable).
+            acted = set(state.acted.get(subtask["name"], []))
+            last_tool = bas[-1].get("tool")
+            for ba in bas:
+                t = ba.get("tool") or ""
+                if t in acted and t != last_tool and _READONLY_TOOL_RE.match(t):
+                    continue
+                if eval_pred(ba.get("when", "always"), state.task_state):
+                    return ba
+            return bas[-1]
         for ba in bas:
             if eval_pred(ba.get("when", "always"), state.task_state):
                 return ba
@@ -1261,6 +1303,18 @@ class SchemaUserAgent(SchemaSoloAgent):
     def _mark_done_if_complete(self, pend, state) -> None:
         spec = self.subtask_spec.get(pend["subtask_type"], {})
         if eval_pred(spec.get("done_when_all", []), state.task_state):
+            if _SEQ_ON:
+                # L-SEQ R-doneguard: a multi-action subtask whose TERMINAL action is a MUTATING
+                # write isn't done until that write has dispatched, so a hallucinated parse of a
+                # non-terminal read (check_payment_request → bill_paid=False) can't close it
+                # before make_payment runs. Gated on a mutating terminal: FIX_* terminals are
+                # the read-only retest (can_send_mms / run_speed_test), whose field done_when_all
+                # already requires — so the guard is off there (original behavior, no loop risk).
+                bas = spec.get("base_actions", []) or []
+                last_tool = (bas[-1].get("tool") or "") if bas else ""
+                if (len(bas) > 1 and _MUT_TOOL_RE.match(last_tool)
+                        and last_tool not in state.acted.get(pend["subtask"], [])):
+                    return
             state.subtask_done[pend["subtask"]] = True
             if state.active_subtask == pend["subtask"]:
                 state.active_subtask = None
@@ -1355,6 +1409,7 @@ class SchemaUserAgent(SchemaSoloAgent):
                 if pend["subtask_type"] == "IDENTIFY_CUSTOMER" and not state.task_state.get("customer_id"):
                     state.task_state["phone_number"] = None
                     state.subtask_done.pop(pend["subtask"], None)
+                    state.acted.pop(pend["subtask"], None)  # L-SEQ: re-opened → re-dispatch its actions
                     state.active_subtask = None
 
         # 2) BOOTSTRAP: we need the phone number before the schema walk can run.
@@ -1423,6 +1478,7 @@ class SchemaUserAgent(SchemaSoloAgent):
                     # reset give-up counters, and let the walk pick it next.
                     target = act[1]
                     state.subtask_done.pop(target, None)
+                    state.acted.pop(target, None)  # L-SEQ: re-opened → re-dispatch its actions
                     if target in state.entered:
                         state.entered.remove(target)
                     state.active_subtask = target
@@ -1512,6 +1568,10 @@ class SchemaUserAgent(SchemaSoloAgent):
                         "tool_call_id": call.id,
                     }
                     state.pending_kind = "tool"
+                    if _SEQ_ON:
+                        state.acted.setdefault(subtask["name"], [])
+                        if call.name not in state.acted[subtask["name"]]:
+                            state.acted[subtask["name"]].append(call.name)
                     _state_log({"kind": "exec", "task_id": tid, "subtask": subtask["name"],
                                 "subtask_type": subtask["subtask_type"], "chosen_tool": call.name,
                                 "args": call.arguments, "side": "agent",
@@ -1551,6 +1611,10 @@ class SchemaUserAgent(SchemaSoloAgent):
             "shotgun": shot_ba is not None,
         }
         state.pending_kind = "user"
+        if _SEQ_ON and shot_ba is None:
+            state.acted.setdefault(subtask["name"], [])
+            if tool_name not in state.acted[subtask["name"]]:
+                state.acted[subtask["name"]].append(tool_name)
         _state_log({"kind": "exec", "task_id": tid, "subtask": subtask["name"],
                     "subtask_type": subtask["subtask_type"], "chosen_tool": tool_name,
                     "side": "user", "instruction": instr,
