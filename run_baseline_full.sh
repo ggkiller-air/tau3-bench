@@ -14,6 +14,7 @@ mkdir -p "data/simulations/$SAVE"
 export SCHEMAFLEX_SPEC_DIR=memory
 export SCHEMAFLEX_STATE_LOG="data/simulations/$SAVE/state_log.jsonl"
 export SCHEMAFLEX_TOKEN_LOG="data/simulations/$SAVE/tokens.json"
+export SCHEMAFLEX_TOKEN_TRACE="data/simulations/$SAVE/token_trace.jsonl"
 
 echo "[$(date '+%H:%M:%S')] start FULL baseline: 20 tasks x 4 trials"
 conda run --no-capture-output -n tau3bench tau2 run \
@@ -22,6 +23,6 @@ conda run --no-capture-output -n tau3bench tau2 run \
   --agent-llm-args '{"temperature":0.0,"api_base":"http://127.0.0.1:9000/v1"}' \
   --user-llm openai/gpt-5.4 \
   --task-set-name telecom_small \
-  --num-trials 4 --max-steps 40 --max-concurrency 8 \
+  --num-trials 4 --max-steps 100 --max-concurrency 8 \
   --save-to "$SAVE"
 echo "[$(date '+%H:%M:%S')] FULL baseline done rc=$?"

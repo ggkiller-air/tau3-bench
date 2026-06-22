@@ -16,6 +16,7 @@ export SCHEMAFLEX_SPEC_DIR=memory   # CLAUDE.md §9 写的 memory_user 是笔误
 export SCHEMAFLEX_REPLAN=1
 export SCHEMAFLEX_STATE_LOG=data/simulations/user_replan/state_log.jsonl
 export SCHEMAFLEX_TOKEN_LOG=data/simulations/user_replan/tokens.json
+export SCHEMAFLEX_TOKEN_TRACE="data/simulations/$SAVE/token_trace.jsonl"
 
 # 冒烟可重复跑：清掉上一次 user_replan 结果，避免 try_resume 卡 FileExistsError
 rm -rf data/simulations/user_replan
@@ -28,6 +29,6 @@ conda run --no-capture-output -n tau3bench tau2 run \
   --agent-llm-args '{"temperature":0.0,"api_base":"http://127.0.0.1:9000/v1"}' \
   --user-llm openai/gpt-5.4 \
   --task-set-name telecom_small \
-  --num-trials 1 --max-steps 40 --num-tasks 3 \
+  --num-trials 1 --max-steps 100 --num-tasks 3 \
   --save-to user_replan
 echo "[$(date '+%H:%M:%S')] smoke done rc=$?"

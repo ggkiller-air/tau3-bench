@@ -104,8 +104,8 @@ def _literal(tok: str):
         return False
     if tok == "null":
         return None
-    if len(tok) >= 2 and tok[0] == "'" and tok[-1] == "'":
-        return tok[1:-1]
+    if len(tok) >= 2 and tok[0] in ("'", '"') and tok[-1] == tok[0]:
+        return tok[1:-1]  # strip single OR double quotes (specs mix both styles)
     try:
         return int(tok)
     except ValueError:
@@ -327,7 +327,7 @@ _ROLE_BY_CALL = {
 }
 
 
-def _record_tokens(task_id: str, call_name: str, msg) -> None:
+def _record_tokens(task_id: str, call_name: str, msg, sim_seed=None) -> None:
     role = _ROLE_BY_CALL.get(call_name)
     if role is None:
         return
@@ -338,17 +338,42 @@ def _record_tokens(task_id: str, call_name: str, msg) -> None:
         p, c = (getattr(u, "prompt_tokens", 0) or 0), (getattr(u, "completion_tokens", 0) or 0)
     else:
         return
-    rec = _SCHEMAFLEX_TOKENS.setdefault(
-        task_id, {"macro": 0, "executor": 0, "updater": 0, "prompt": 0, "completion": 0, "calls": 0}
-    )
+    # Key per-SIM = (task_id, seed) so num-trials>1 trials stay SEPARABLE — pass^4 decay
+    # analysis needs per-trial token/context, joinable back to results.json by (task_id,
+    # seed). seed is distinct per trial (set via agent.set_seed); None → falls back to
+    # task_id (fine for single-trial runs).
+    key = f"{task_id}␟{sim_seed}" if sim_seed is not None else task_id
+    rec = _SCHEMAFLEX_TOKENS.setdefault(key, {
+        "task_id": task_id, "seed": sim_seed,
+        "macro": 0, "executor": 0, "updater": 0, "prompt": 0, "completion": 0, "calls": 0,
+        "peak_prompt": 0, "peak_prompt_exec": 0,
+    })
     rec[role] += p + c          # per-role total (prompt+completion)
     rec["prompt"] += p          # run-level prompt total (the cacheable bulk)
     rec["completion"] += c
     rec["calls"] += 1
+    # Effective-context tracking: prompt_tokens IS the resident KV / context length of that
+    # call. peak_prompt = max over all calls; peak_prompt_exec = max over EXECUTOR calls =
+    # peak CONVERSATION context (the decision calls that grow with the dialogue — the prime
+    # suspect for long-episode 8B degradation → pass^4 decay).
+    if p > rec["peak_prompt"]:
+        rec["peak_prompt"] = p
+    if role == "executor" and p > rec["peak_prompt_exec"]:
+        rec["peak_prompt_exec"] = p
     path = os.environ.get("SCHEMAFLEX_TOKEN_LOG")
     if path:
         try:
             json.dump(_SCHEMAFLEX_TOKENS, open(path, "w"))
+        except Exception:
+            pass
+    # Per-call JSONL trace (append, O(1)): the prompt-length SERIES per sim, for plotting
+    # context growth over the episode. Enabled only if SCHEMAFLEX_TOKEN_TRACE is set.
+    tpath = os.environ.get("SCHEMAFLEX_TOKEN_TRACE")
+    if tpath:
+        try:
+            with open(tpath, "a") as f:
+                f.write(json.dumps({"task_id": task_id, "seed": sim_seed, "role": role,
+                                    "p": p, "c": c, "i": rec["calls"]}) + "\n")
         except Exception:
             pass
 

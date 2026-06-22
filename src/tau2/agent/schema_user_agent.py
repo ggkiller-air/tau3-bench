@@ -88,6 +88,32 @@ Guidance (translate any tool args like app_name/permission/value into plain word
 
 Write the single instruction message to the customer now."""
 
+# L-GROUND: harden the agent↔user instruction SEAM (the M2 failure). The customer
+# can only act if the instruction maps to ONE concrete control they can find; the
+# default prompt over-translates into invented menu paths ("Settings > About > …")
+# and — because the repair subtasks' executor_sys_rules spell out "Step 1: fix /
+# Step 2: retest" — the 8B BUNDLES the fix with its retest into one compound message,
+# which a one-action-at-a-time customer refuses, looping to max_steps. L-GROUND (a)
+# surfaces the action's literal tool+args so it can be named precisely, (b) drops the
+# "Step N" scaffolding, and (c) swaps in a system prompt that forbids bundling and
+# demands grounded naming. Gated by SCHEMAFLEX_GROUND; OFF = current behavior.
+_GROUND_ON = os.environ.get("SCHEMAFLEX_GROUND", "") not in ("", "0", "false", "False")
+
+_INSTRUCT_SYSTEM_GROUND = """You are a friendly telecom support agent talking to a customer who performs device actions themselves (you cannot do it for them). Write ONE short instruction for the SINGLE action given below — and nothing else.
+
+GROUND IT so the customer can actually act — your words must map to one concrete control they can find:
+- Use the action's literal arg VALUES verbatim — app names, setting names, permission values. Do NOT rename, capitalise, or prettify them. If app_name=messaging, say "your messaging app" — NOT "Messages" or "your Messages app"; the customer's controls are labelled with those exact strings and a renamed one will NOT be found.
+- Name the exact setting/toggle. Examples: toggle_wifi_calling → "turn off Wi‑Fi Calling"; grant_app_permission (app_name=messaging, permission=sms) → "in your messaging app, grant the SMS permission"; reset_apn_settings → "reset your APN settings to default"; toggle_roaming → "turn Data Roaming on".
+- Do NOT send the customer hunting through invented menu paths for a value the action names directly.
+- If the action only CHECKS or reads something (a check_… , run_… , get_… , or can_… tool), ask them to LOOK at it and report what it shows / whether it works — do NOT tell them to enable, change, or toggle anything (there may be no such setting).
+
+ONE ACTION ONLY — this is the single most common failure:
+- Do the ONE action above. If the guidance mentions a later check, retest, reboot, or "Step 2" (e.g. "then check if you can send MMS"), DO NOT include it — that is a separate later turn.
+- Never bundle two settings/actions, or an action plus a verification, in one message. Many customers refuse a multi-part request and the whole turn is wasted.
+- End by asking them to report what they see or what happened.
+
+One or two sentences. No markdown, no lists, no preamble."""
+
 _PHONE_SYSTEM = """Extract the customer's telephone number from their message.
 Return ONLY a JSON object: {"phone_number": "<number>"} — or {"phone_number": null} if none is present.
 Do not invent a number."""
@@ -184,6 +210,15 @@ _SUPERVISOR_MAX = int(os.environ.get("SCHEMAFLEX_SUPERVISOR_MAX", "4"))
 # walk (clean A/B). Independent of and composable with SAGE / SUPERVISOR.
 # --------------------------------------------------------------------------- #
 _REPLAN_ON = os.environ.get("SCHEMAFLEX_REPLAN", "") not in ("", "0", "false", "False")
+# DIAG (retest-yield): break REPLAN's wrong-repair thrash on mms. When the speculative
+# permission repairs (fixStoragePerm/fixSmsPerm, gated `mms_*_perm != true`, eligible via
+# the None default) fire but DON'T fix it, the goal retest (tier-3) keeps being re-picked
+# over the tier-2 diagnostics — so the agent loops retestMms and never reaches
+# checkWifiCalling/checkNetworkMode to find the REAL cause. DIAG demotes a goal retest that
+# has already run-and-failed while an informative diagnostic still pends, so the diagnostic
+# runs and reveals the correct repair. It does NOT touch repair priority — tasks the
+# speculative repair actually fixes still close fast. Gated; OFF = REPLAN unchanged.
+_DIAG_ON = os.environ.get("SCHEMAFLEX_DIAG", "") not in ("", "0", "false", "False")
 # A subtask WRITES backend/device state (a "repair") if its subtask_type carries
 # a fix-prefix OR any base_action tool mutates. Classify pure-read diagnostics
 # (only get_/check_/run_speed_test/can_send_mms) as skippable; anything else is
@@ -194,6 +229,96 @@ _MUT_TOOL_RE = re.compile(
     r"refuel_|grant_|revoke_|disconnect_|resume_|reboot_|send_payment|pay_)"
 )
 _READONLY_TOOL_RE = re.compile(r"^(get_|check_|run_speed_test|can_send_mms)")
+
+# L-SHOTGUN: mms speculative fixed-order repair. The mms root cause is undiagnosable
+# from the complaint — 6 distinct faults (network_mode / wifi_calling / apn / sms_perm /
+# storage_perm / both) share a BYTE-IDENTICAL "can't send MMS for the past few hours"
+# ticket and identical known_info, so any pre-diagnosis root-cause prediction is a 1-of-6
+# guess (this is why L-SELECT, a strong-model supervisor, couldn't pick correctly — the
+# signal simply isn't in context yet). And the 40-step budget can't fit
+# diagnose→fix→retest per candidate. BUT: (a) reward is pure ENV_ASSERTION on
+# can_send_mms — no DB/ACTION basis (verified across all 8 mms tasks), so extra/odd
+# device mutations are NOT penalized; (b) _can_send_mms is an AND of every condition, so
+# making them ALL true necessarily succeeds regardless of which one was broken; (c) every
+# fix is idempotent or verified-harmless — set_network_mode/reset_apn/grant_perm/reboot
+# are idempotent, and a blind toggle_wifi_calling is safe on ALL 6 mms tasks because
+# wifi_calling_mms_over_wifi defaults False everywhere except bad_wifi_calling (the AND
+# makes the enabled-flip inert). So once basic connectivity holds, SKIP all diagnostics
+# and fire every repair in a fixed safe order, then one can_send_mms retest → L-CLOSE.
+# Orchestration-only, zero extra LLM cost; sidesteps the root-cause discrimination that
+# L-SELECT proved unsolvable. Gated by SCHEMAFLEX_SHOTGUN; OFF = byte-identical.
+_SHOTGUN_ON = os.environ.get("SCHEMAFLEX_SHOTGUN", "") not in ("", "0", "false", "False")
+# Fixed plan = family-sequence subtask names (indexed, so retestMms may repeat). We fire
+# each subtask's base_action[0] (the mutating fix), bypassing its diagnostic `when`.
+# BATCHED RETEST: the 4 immediate-effect fixes (perms/network/wifi all take effect at
+# once) run first, then a retest — which CLOSES 5 of 6 mms faults (storage/sms/both-perm,
+# network, wifi) the moment can_send_mms flips true, so we never pay for the apn tail.
+# Only an apn fault leaves the first retest false; we then reset_apn (flags reset_at_reboot)
+# → reboot (executes the reset → restores mmsc) → second retest. Order within the batch is
+# harmless (all idempotent / verified-safe). This early close is what keeps the plan inside
+# the 40-step budget: the v1 single-trailing-retest plan fixed the fault mid-sequence but
+# ran out of steps before ever measuring can_send_mms, so L-CLOSE never fired (0/6).
+# `checkMmsPerms` leads: a blind grant to a COLD (diagnosis-skipped) customer gets balked
+# ("how do I do that?"), and a balk skips the fix → perm tasks regress (the directive-first
+# attempt to fix this by phrasing failed: verbose Settings paths just invite narration).
+# The fix is what the NORMAL walk does — run check_app_permissions FIRST: it (a) PRIMES the
+# customer (navigates them to the permissions screen, so the subsequent grant lands first
+# try) and (b) reveals mms_*_perm so a perm already granted is SKIPPED (`_SHOTGUN_SKIP_WHEN`)
+# — which also frees the budget that lets the apn tail fit (a non-perm fault skips both
+# grants). It's a priming/routing check, NOT the root-cause discrimination L-SELECT/DIAG
+# failed at (shotgun still blind-fixes network/wifi/apn).
+_SHOTGUN_PLAN = [
+    "checkMmsPerms",      # check_app_permissions(messaging) — PRIME user + reveal mms_*_perm
+    "fixStoragePerm",     # grant storage — SKIP if mms_storage_perm already true
+    "fixSmsPerm",         # grant sms     — SKIP if mms_sms_perm already true
+    "fixNetworkModeMms",  # set_network_mode_preference(4g_5g)  — idempotent
+    "fixWifiCalling",     # toggle_wifi_calling()              — verified safe ∀ mms
+    "retestMms",          # can_send_mms() → closes perms/network/wifi faults
+    "resetApnMms",        # reset_apn_settings() — apn fault only past here
+    "rebootMms",          # reboot_device() — executes APN reset → restores mmsc
+    "retestMms",          # can_send_mms() → closes the apn fault
+]
+# A plan step whose fix is already satisfied (perm granted) is skipped without firing —
+# saves the turn AND lets the apn path fit the 40-step budget on non-perm faults.
+_SHOTGUN_SKIP_WHEN = {
+    "fixStoragePerm": "mms_storage_perm",
+    "fixSmsPerm": "mms_sms_perm",
+}
+# A SHOTGUN step advances only once its fix actually LANDS (the user executed the tool, so
+# its parse wrote task_state). A cold user who skipped diagnosis often balks on the first
+# bare instruction ("grant the storage permission" → "how do I do that?"); without sticking
+# we'd skip the fix forever (the v2 perm-task regression). So re-instruct the SAME step (a
+# balk costs only 2 messages) up to this many times, with a directive focus hint on retry,
+# before giving up and advancing — mirroring the normal walk's stickiness.
+_SHOTGUN_RETRY_CAP = 3
+
+# L-ELICIT: a repair can be gated on a CONTEXT PRECONDITION the schema assumes was
+# pre-filled from the ticket but which is actually obtainable by ASKING the user — e.g.
+# makePayment is gated `pay_allowed == true`, and pay_allowed is set ONLY by init_rules
+# from the ticket text. When the authorization is conditional/interactive ("if asked, you
+# accept") rather than stated upfront, the field stays null, the repair is dead-gated, and
+# the agent gives up → transfer → reward 0 (overdue_bill_suspension). The GENERAL criterion
+# (no hard-coded field): a field that (a) appears in some repair's `when`, (b) is produced
+# by NO subtask (so it's a ticket-context field, not a diagnostic signal), and (c) is still
+# null, can only be obtained by asking. So at the give-up point, if a pending on-chain
+# repair is blocked solely by such a field, ASK the user a yes/no question, parse the
+# answer, set the field, and let the flow cascade. Covers pay_allowed / is_abroad / … with
+# one mechanism. Gated by SCHEMAFLEX_ELICIT; OFF = byte-identical.
+_ELICIT_ON = os.environ.get("SCHEMAFLEX_ELICIT", "") not in ("", "0", "false", "False")
+
+_ELICIT_SYSTEM = """You are a friendly telecom support agent. Before you can apply a fix, you need ONE piece of authorization or context from the customer that only they can give (e.g. permission to charge an overdue bill, or whether they are currently travelling abroad). Write ONE short, friendly yes/no question that obtains exactly that — name the concrete thing (the specific bill, the specific action). Do NOT explain steps or list options; just ask the single question. Output only the question text."""
+
+_ELICIT_USER = """You need the customer's: {field}
+Granting it unblocks this fix: {repair_goal}
+Overall goal of the call: {task_goal}
+Current machine state (use it for concrete details like the bill id): {task_state}
+Write the single short yes/no question now."""
+
+_AUTH_SYSTEM = """The customer was just asked a yes/no authorization/context question. Read their reply and answer with EXACTLY one lowercase word:
+- yes  — they agree / accept / authorize / confirm it is true
+- no   — they decline / refuse / say it is false
+- unclear — anything else (a question back, hesitation, off-topic)
+Output only that one word."""
 
 _SUPERVISOR_SYSTEM = """You are a DYNAMIC SCHEDULER supervising a small-model agent troubleshooting with a live customer. The agent normally follows a FIXED schema sequence of subtasks, but it is now DEADLOCKED — stuck repeating one step. Each subtask is an action PRIMITIVE with a goal and a completion condition. You are NOT bound by the fixed sequence: based on the current machine state, pick the single best next move to break the deadlock.
 
@@ -242,13 +367,23 @@ class SchemaUserAgentState(SchemaSoloAgentState):
     stuck: dict = {}  # subtask name -> consecutive no-progress (empty-write) replies
     asked: dict = {}  # SAGE aspect history n_a: task_state field -> #times elicited
     supervisor_calls: int = 0  # sparse big-model supervisor invocations this episode
+    repair_attempted: bool = False  # a mutating device/backend tool was dispatched this episode (L-CLOSE guard)
     # what we are waiting on: 'tool' (env result), 'user' (reply to an instruction),
     # 'await_phone' (reply to the phone-number question), or None.
     pending_kind: Optional[str] = None
+    shotgun_idx: int = 0  # L-SHOTGUN: index of the next mms repair-plan step to fire
+    shotgun_retry: int = 0  # L-SHOTGUN: re-instruct count for the current step (until it lands)
+    elicited: list = []  # L-ELICIT: context-precondition fields already asked of the user
 
 
 class SchemaUserAgent(SchemaSoloAgent):
     """Non-solo schema agent (see module docstring)."""
+
+    # Capture the per-sim seed (orchestrator calls set_seed once per simulation; base impl
+    # is an optional no-op). seed is distinct per trial → used to key the token log per-SIM
+    # (task_id, seed) so num-trials>1 trials stay separable for pass^4 decay analysis.
+    def set_seed(self, seed: int) -> None:
+        self._seed = seed
 
     # -- neutralize the solo-only __init__ steps ------------------------- #
     def add_stop_tool(self) -> None:  # no `done` tool in dialogue mode
@@ -425,6 +560,132 @@ class SchemaUserAgent(SchemaSoloAgent):
             return True
         return False
 
+    # -- L-SHOTGUN: mms speculative fixed-order repair ------------------- #
+    def _shotgun_ready(self, state):
+        """Active as soon as the line is resolved — we deliberately SKIP the
+        checkService/diagnoseData prerequisites (≈8 messages of network-check + speed-test)
+        because none of the mms fixes or the can_send_mms close depend on service_status or
+        speed_test, and that overhead is what blew the 40-step budget in v1. The step-3
+        resolved-check already gates closure, so no `resolved` test is needed here."""
+        if not _SHOTGUN_ON or state.family != "mms":
+            return False
+        return state.task_state.get("line_id") is not None
+
+    def _shotgun_next(self, state):
+        """First un-skipped plan step at/after the current index as (subtask,
+        base_action[0]); (None, None) when the plan is exhausted (→ fall back to the normal
+        walk / L-CLOSE). Progress is tracked by state.shotgun_idx, NOT done_when_all — those
+        aspects depend on diagnostic fields SHOTGUN skips, so they never close on their own;
+        index also lets retestMms repeat (batched-retest plan). A step whose fix is already
+        satisfied (`_SHOTGUN_SKIP_WHEN`, e.g. perm already granted per the checkMmsPerms
+        read) is advanced past WITHOUT firing — saves the turn and frees apn-tail budget."""
+        ts = state.task_state
+        idx = state.shotgun_idx or 0
+        while idx < len(_SHOTGUN_PLAN):
+            name = _SHOTGUN_PLAN[idx]
+            skip_field = _SHOTGUN_SKIP_WHEN.get(name)
+            if skip_field is not None and ts.get(skip_field) is True:
+                idx += 1
+                continue  # fix already satisfied — skip without consuming a turn
+            st = self._subtask_by_name(state, name)
+            bas = self.subtask_spec.get(st["subtask_type"], {}).get("base_actions", []) if st else []
+            if not bas:
+                idx += 1
+                continue
+            state.shotgun_idx = idx  # persist any skips so INGEST's +1 lands correctly
+            return st, bas[0]
+        state.shotgun_idx = idx
+        return None, None
+
+    # -- L-ELICIT: ask the user for a null context-precondition --------- #
+    def _context_precondition_fields(self, state):
+        """Fields a subtask `when` depends on that NO subtask produces — the schema assumes
+        the ticket pre-filled them (pay_allowed / is_abroad / …). Cached per family. These
+        are the only fields that, when null, can be obtained by ASKING the user (a diagnostic
+        field would instead be obtained by running its check_* tool)."""
+        cache = getattr(self, "_ctx_field_cache", None)
+        if cache is None:
+            cache = self._ctx_field_cache = {}
+        fam = state.family
+        if fam not in cache:
+            seq = self._family_spec(state)["base_subtask_sequence"]
+            produced, used = set(), set()
+            for st in seq:
+                produced |= self._produces(st["subtask_type"])
+                used |= set(self._pred_fields(st.get("when", "always")))
+            structural = {"goal", "customer_name", "phone_number", "resolved",
+                          "candidate_line_ids", "customer_id", "line_id", "escalated"}
+            cache[fam] = (used - produced) - structural
+        return cache[fam]
+
+    def _elicit_target(self, state):
+        """(field, target_bool, repair_subtask) to ask the user for, or None. Picks a
+        pending, on-chain REPAIR that is NOT eligible only because a single context-
+        precondition field (no producer) is still null — asking the user for it unblocks
+        the repair and the downstream flow cascades."""
+        if not _ELICIT_ON:
+            return None
+        ctx = self._context_precondition_fields(state)
+        if not ctx:
+            return None
+        ts = state.task_state
+        asked = set(state.elicited or [])
+        idx = self._causal_index(state)
+        for st in self._family_spec(state)["base_subtask_sequence"]:
+            t = st["subtask_type"]
+            when = st.get("when", "always")
+            if state.subtask_done.get(st["name"]) or not idx["is_repair"][t]:
+                continue
+            if eval_pred(when, ts):
+                continue  # already eligible
+            # Candidate context-precondition atoms: `field == true/false`, field is a
+            # no-producer context field, currently null, not yet asked.
+            for m in re.finditer(r"task_state\.([a-zA-Z_]\w*)\s*==\s*(true|false)", when):
+                f, v = m.group(1), m.group(2)
+                if f not in ctx or ts.get(f) is not None or f in asked:
+                    continue
+                tv = (v == "true")
+                # Tight gate (fixes over-firing): elicit f ONLY if setting it to its target
+                # makes THIS repair eligible right now — i.e. every OTHER atom already
+                # holds. Otherwise the repair isn't actually one step away (e.g. makePayment
+                # in a non-billing task where payment_requested is still null), and asking
+                # "do you authorize payment?" is a nonsensical derail.
+                probe = dict(ts)
+                probe[f] = tv
+                if eval_pred(when, probe):
+                    return f, tv, st
+        return None
+
+    def _phrase_elicitation(self, field, repair, state) -> str:
+        import json
+        spec = self.subtask_spec.get(repair["subtask_type"], {})
+        user = _ELICIT_USER.format(
+            field=field,
+            repair_goal=spec.get("goal_template", ""),
+            task_goal=state.task_state.get("goal", ""),
+            task_state=json.dumps(state.task_state, ensure_ascii=False),
+        )
+        msg = generate(
+            model=self.llm,
+            messages=[SystemMessage(role="system", content=_ELICIT_SYSTEM),
+                      UserMessage(role="user", content=user)],
+            call_name="schema_executor", **self._gen_kwargs(),
+        )
+        _record_tokens(getattr(self.task, "id", "?"), "schema_executor", msg, sim_seed=getattr(self, "_seed", None))
+        return (msg.content or "").strip() or "Before I proceed, do you authorize this action?"
+
+    def _parse_authorization(self, text: str) -> str:
+        """Classify a yes/no authorization reply → 'yes' | 'no' | 'unclear'."""
+        msg = generate(
+            model=self.llm,
+            messages=[SystemMessage(role="system", content=_AUTH_SYSTEM),
+                      UserMessage(role="user", content=text)],
+            call_name="schema_state_updater", **self._gen_kwargs(),
+        )
+        _record_tokens(getattr(self.task, "id", "?"), "schema_state_updater", msg, sim_seed=getattr(self, "_seed", None))
+        w = (msg.content or "").strip().lower()
+        return "yes" if w.startswith("yes") else ("no" if w.startswith("no") else "unclear")
+
     # -- REPLAN: causal-chain dynamic subtask re-ranker ------------------ #
     def _active_subtask(self, state):  # type: ignore[override]
         """User-mode subtask selector. OFF → parent positional walk (byte-identical)."""
@@ -565,6 +826,31 @@ class SchemaUserAgent(SchemaSoloAgent):
                    for st in self._family_spec(state)["base_subtask_sequence"]
                    if state.subtask_done.get(st["name"]))
 
+    def _retest_exhausted(self, state, idx, needed):
+        """DIAG retest-yield: the family goal-core field has already been MEASURED as
+        still failing (a repair ran, the retest confirmed it didn't work) AND an un-run,
+        live, informative diagnostic still pends. Re-running the retest is then futile —
+        yield to the diagnostic that may reveal a DIFFERENT root cause/repair, instead of
+        looping the goal retest to max_steps (the mms wrong-repair thrash: fixStoragePerm
+        →fixSmsPerm→retestMms loop that never reaches checkWifiCalling). When the goal is
+        actually met, or no diagnostic is left, returns False so the normal tier-3 closer
+        (and the give-up gate) apply unchanged. Does NOT touch repair priority, so the
+        fast path on tasks the speculative repair actually fixes is preserved."""
+        ts = state.task_state
+        goal_core = idx["goal_fields"] - {"resolved"}
+        if not any(ts.get(f) is not None for f in goal_core):
+            return False  # goal never measured yet → let the retest run
+        swa = self._family_spec(state).get("success_when_all", [])
+        if not swa or eval_pred(swa, ts):
+            return False  # goal actually MET → let it close, don't yield
+        seq = self._family_spec(state)["base_subtask_sequence"]
+        for st in seq:
+            if idx["is_repair"][st["subtask_type"]] or state.subtask_done.get(st["name"]):
+                continue
+            if self._informative(state, idx, needed, st) and self._when_live(st.get("when", "always"), ts):
+                return True  # a fresh diagnostic can still reveal a different repair
+        return False
+
     def _priority(self, state, idx, needed, subtask):
         """4 tiers (high→low), tie-broken by original positional order (stable, so
         ON==OFF absent a higher tier):
@@ -585,7 +871,10 @@ class SchemaUserAgent(SchemaSoloAgent):
             if not self._any_repair_done(state, idx):
                 tier = 1  # premature: nothing fixed yet to confirm
             elif prod & goal_core:
-                tier = 3  # the right closer for THIS family
+                if _DIAG_ON and self._retest_exhausted(state, idx, needed):
+                    tier = 1  # already retested & still failing → yield to pending diagnostics
+                else:
+                    tier = 3  # the right closer for THIS family
             else:
                 tier = 2  # a retest that can't confirm the family goal
         elif self._informative(state, idx, needed, subtask):
@@ -732,7 +1021,7 @@ class SchemaUserAgent(SchemaSoloAgent):
                 call_name="schema_supervisor",
                 temperature=0.0, timeout=60.0,
             )
-            _record_tokens(tid, "schema_supervisor", msg)
+            _record_tokens(tid, "schema_supervisor", msg, sim_seed=getattr(self, "_seed", None))
             obj = _extract_json(msg.content or "")
             if isinstance(obj, dict):
                 break
@@ -818,7 +1107,7 @@ class SchemaUserAgent(SchemaSoloAgent):
             call_name="schema_macro_init",
             **self._gen_kwargs(),
         )
-        _record_tokens(getattr(self.task, "id", "?"), "schema_macro_init", msg)
+        _record_tokens(getattr(self.task, "id", "?"), "schema_macro_init", msg, sim_seed=getattr(self, "_seed", None))
         obj = _extract_json(msg.content or "")
         if isinstance(obj, dict):
             ph = _clean_phone(obj.get("phone_number"))
@@ -859,32 +1148,51 @@ class SchemaUserAgent(SchemaSoloAgent):
 
     def _phrase_instruction(self, subtask, chosen, state, focus: str = "") -> str:
         spec = self.subtask_spec[subtask["subtask_type"]]
+
+        def _act_line(ba):
+            # L-GROUND surfaces the literal tool args (app_name=…, permission=…) so the
+            # instruction can name the exact control; OFF keeps the original tool: when.
+            argstr = ""
+            if _GROUND_ON and isinstance(ba.get("args"), dict) and ba["args"]:
+                argstr = " (" + ", ".join(f"{k}={v}" for k, v in ba["args"].items()) + ")"
+            return f"- {ba.get('tool')}{argstr}: {ba.get('when', '')}"
+
         if chosen is not None:
-            actions = f"- {chosen.get('tool')}: {chosen.get('when', '')}"
+            actions = _act_line(chosen)
         else:
-            actions = "\n".join(
-                f"- {ba['tool']}: {ba.get('when', '')}" for ba in spec.get("base_actions", [])
-            )
-        rules = "\n".join(f"- {r}" for r in spec.get("executor_sys_rules", []))
+            actions = "\n".join(_act_line(ba) for ba in spec.get("base_actions", []))
+        rule_list = spec.get("executor_sys_rules", [])
+        if _GROUND_ON:
+            # drop the "Step N:" scaffolding — it makes the 8B bundle the fix with its
+            # retest/reboot into one compound instruction (the M2 loop). The single
+            # action is already pinned by `actions`.
+            rule_list = [r for r in rule_list if not str(r).strip().lower().startswith("step ")]
+        rules = "\n".join(f"- {r}" for r in rule_list)
         if focus:  # SAGE: surface the closed option set on a re-ask
             rules = f"{rules}\n{focus}" if rules else focus
+        # L-GROUND also drops the goal_template here: it states the WHOLE multi-step
+        # fix ("fix via toggle_data_saver_mode, run_speed_test"), which leaks the
+        # later retest into a single-action instruction → the 8B bundles "toggle +
+        # run speed test", the one-action customer refuses, and the agent loops to
+        # max_steps with the retest never run (the type-(a) "repair done, no close").
+        goal = "" if _GROUND_ON else spec.get("goal_template", "")
         user = _INSTRUCT_USER.format(
             subtask_name=subtask["name"],
             subtask_type=subtask["subtask_type"],
-            goal=spec.get("goal_template", ""),
+            goal=goal,
             actions=actions,
             rules=rules,
         )
         msg = generate(
             model=self.llm,
             messages=[
-                SystemMessage(role="system", content=_INSTRUCT_SYSTEM),
+                SystemMessage(role="system", content=_INSTRUCT_SYSTEM_GROUND if _GROUND_ON else _INSTRUCT_SYSTEM),
                 UserMessage(role="user", content=user),
             ],
             call_name="schema_executor",
             **self._gen_kwargs(),
         )
-        _record_tokens(getattr(self.task, "id", "?"), "schema_executor", msg)
+        _record_tokens(getattr(self.task, "id", "?"), "schema_executor", msg, sim_seed=getattr(self, "_seed", None))
         return (msg.content or "").strip() or "Could you try that step and tell me what you see?"
 
     def _update_from_user_reply(self, subtask_type, subtask_name, action_name, reply_text, state) -> None:
@@ -933,7 +1241,7 @@ class SchemaUserAgent(SchemaSoloAgent):
                 model=self.llm, messages=messages,
                 call_name="schema_state_updater", **self._gen_kwargs(),
             )
-            _record_tokens(getattr(self.task, "id", "?"), "schema_state_updater", msg)
+            _record_tokens(getattr(self.task, "id", "?"), "schema_state_updater", msg, sim_seed=getattr(self, "_seed", None))
             ops = _parse_patch_ops(msg.content or "")
             if ops is not None:
                 break
@@ -969,12 +1277,35 @@ class SchemaUserAgent(SchemaSoloAgent):
                 self._parse_phone(text, state)
                 state.pending = None
                 state.pending_kind = None
+            elif state.pending_kind == "await_elicit":
+                # L-ELICIT: parse the yes/no authorization reply into the context field.
+                pend = state.pending or {}
+                f, v = pend.get("elicit_field"), pend.get("elicit_value")
+                ans = self._parse_authorization(text)
+                if ans == "yes":
+                    state.task_state[f] = v
+                elif ans == "no":
+                    state.task_state[f] = (not v) if isinstance(v, bool) else False
+                # 'unclear' → leave null (the `elicited` guard still prevents a re-ask)
+                _state_log({"kind": "elicit_reply", "task_id": tid, "field": f,
+                            "answer": ans, "value": state.task_state.get(f),
+                            "task_state": dict(state.task_state)})
+                state.pending = None
+                state.pending_kind = None
             elif state.pending is not None and state.pending_kind == "user":
                 pend = state.pending
                 written = self._update_from_user_reply(
                     pend["subtask_type"], pend["subtask"], pend["tool_name"], text, state
                 )
                 self._mark_done_if_complete(pend, state)
+                # L-SHOTGUN: advance the plan only when the fix LANDED (written) or we've
+                # re-instructed enough; a balk (written=False) re-fires the same step.
+                if pend.get("shotgun"):
+                    if written or (state.shotgun_retry or 0) >= _SHOTGUN_RETRY_CAP:
+                        state.shotgun_idx = (state.shotgun_idx or 0) + 1
+                        state.shotgun_retry = 0
+                    else:
+                        state.shotgun_retry = (state.shotgun_retry or 0) + 1
                 sk = pend["subtask"]
                 if state.subtask_done.get(sk):
                     state.stuck.pop(sk, None)
@@ -1036,6 +1367,20 @@ class SchemaUserAgent(SchemaSoloAgent):
             )
 
         # 3) RESOLVED → closing message; let the user simulator stop.
+        #    Proactive goal-satisfied close: also set `resolved` when the family's
+        #    success_when_all predicate already holds (a retest reached the goal
+        #    state, e.g. speed_test=='excellent' / can_send_mms==true) but no
+        #    VERIFY subtask formally closed it. Otherwise the agent grinds to
+        #    max_steps, which the evaluator HARD-ZEROS (it never even checks the
+        #    env_assertions) — turning an already-solved task into reward 0.
+        #    Keys off success_when_all = the exact eval criterion, so a true
+        #    predicate means the goal state is genuinely reached.
+        if not state.task_state.get("resolved") and state.repair_attempted:
+            _swa = self._family_spec(state).get("success_when_all", [])
+            if _swa and eval_pred(_swa, state.task_state):
+                state.task_state["resolved"] = True
+                _state_log({"kind": "close", "task_id": tid, "reason": "goal_satisfied",
+                            "success_when_all": _swa, "task_state": dict(state.task_state)})
         if state.task_state.get("resolved"):
             _state_log({"kind": "stop", "task_id": tid, "reason": "resolved",
                         "task_state": dict(state.task_state)})
@@ -1048,8 +1393,14 @@ class SchemaUserAgent(SchemaSoloAgent):
         #    worth pursuing. SAGE on: EVPI−cost < α·max_pi (or n_a backstop);
         #    SAGE off: original consecutive no-progress ≥ 3. Either way bounds
         #    time so a refused/vague customer can't loop us to max_steps.
-        subtask = self._active_subtask(state)
-        while subtask is not None and self._should_give_up(subtask, state, tid):
+        # L-SHOTGUN short-circuit: in the mms repair zone, drive the fixed speculative
+        # plan instead of the diagnostic walk. Bypasses give-up and done_when_all;
+        # progress is tracked by state.shotgun_fired, closing via the step-3 L-CLOSE.
+        shot_sub, shot_ba = (None, None)
+        if self._shotgun_ready(state):
+            shot_sub, shot_ba = self._shotgun_next(state)
+        subtask = shot_sub if shot_sub is not None else self._active_subtask(state)
+        while shot_sub is None and subtask is not None and self._should_give_up(subtask, state, tid):
             # Dynamic scheduling: this give-up point is exactly where the static
             # schema fails. Spend a SPARSE supervisor (big-model) call before
             # abandoning — it may recover within the schema's allowed actions
@@ -1094,7 +1445,22 @@ class SchemaUserAgent(SchemaSoloAgent):
             state.active_subtask = None
             state.stuck.pop(subtask["name"], None)
             subtask = self._active_subtask(state)
-        if subtask is None:
+        if shot_sub is None and subtask is None:
+            # L-ELICIT: before giving up, check whether a pending on-chain repair is dead-
+            # gated only by a null context-precondition the user can grant (e.g. makePayment
+            # blocked on pay_allowed). If so, ask for it instead of transferring; the answer
+            # unblocks the repair and the flow cascades to resolution.
+            tgt = self._elicit_target(state)
+            if tgt is not None:
+                field, value, repair = tgt
+                state.elicited = list(state.elicited or []) + [field]
+                question = self._phrase_elicitation(field, repair, state)
+                state.pending = {"elicit_field": field, "elicit_value": value}
+                state.pending_kind = "await_elicit"
+                _state_log({"kind": "elicit", "task_id": tid, "field": field, "value": value,
+                            "repair": repair["name"], "question": question,
+                            "task_state": dict(state.task_state)})
+                return self._say(question, state)
             _state_log({"kind": "stop", "task_id": tid, "reason": "no_active_subtask",
                         "task_state": dict(state.task_state)})
             return self._say(
@@ -1104,7 +1470,26 @@ class SchemaUserAgent(SchemaSoloAgent):
 
         # 5) EXECUTE — route to the next base_action (RC1). agent-side = real tool
         #    call (restricted to that one tool); user-side = instruction text.
-        kind, chosen, tool_name = self._classify(subtask, state)
+        if shot_ba is not None:
+            # L-SHOTGUN: force base_action[0] (the mutating fix), bypassing its diagnostic
+            # `when` that would otherwise fall through to the retest. The index is NOT
+            # advanced here — INGEST advances it only once the fix LANDS (or the retry cap
+            # is hit), so a balked instruction re-fires instead of being skipped. All plan
+            # tools are user-side device actions.
+            chosen, tool_name = shot_ba, shot_ba.get("tool")
+            kind = "agent" if tool_name in self._agent_tool_names else "user"
+            _state_log({"kind": "shotgun", "task_id": tid, "subtask": subtask["name"],
+                        "tool": tool_name, "idx": state.shotgun_idx,
+                        "retry": state.shotgun_retry, "task_state": dict(state.task_state)})
+        else:
+            kind, chosen, tool_name = self._classify(subtask, state)
+        # L-CLOSE guard: record that a real device/backend repair was dispatched
+        # this episode. Proactive close requires this, so a parse error that wrongly
+        # sets a goal field (e.g. service_status="connected" while the device shows
+        # no_service) can't close a task on which we never even tried a fix — the
+        # observed service false-close ran pure diagnostics, never a mutating tool.
+        if _MUT_TOOL_RE.match(tool_name or ""):
+            state.repair_attempted = True
         if kind == "agent":
             subset = [_SanitizedTool(t) for t in self.tools if t.name == tool_name]
             if subset:
@@ -1117,7 +1502,7 @@ class SchemaUserAgent(SchemaSoloAgent):
                     call_name="schema_executor",
                     **self._gen_kwargs(),
                 )
-                _record_tokens(tid, "schema_executor", am)
+                _record_tokens(tid, "schema_executor", am, sim_seed=getattr(self, "_seed", None))
                 if am.is_tool_call():
                     call = am.tool_calls[0]
                     state.pending = {
@@ -1136,6 +1521,24 @@ class SchemaUserAgent(SchemaSoloAgent):
 
         # user-side (or agent tool unexpectedly unavailable → ask the customer)
         focus = self._sage_focus_hint(subtask["subtask_type"], state)
+        if shot_ba is not None:
+            parts = []
+            # App-name grounding: the device app is literally "messaging" (lowercase). The
+            # user-sim otherwise normalizes "your messaging app" → the proper noun
+            # "Messages" → check_app_permissions/grant return "app not found" → perms
+            # misread as missing → skip/prime defeated → balk loop (seen in 5/24 mms sims,
+            # killing apn's budget and flaking the perm tasks). Pin the literal token.
+            if tool_name in ("check_app_permissions", "grant_app_permission"):
+                parts.append('- The app is named exactly "messaging" (all lowercase). There '
+                             'is no app called "Messages" — refer to it as "messaging".')
+            if (state.shotgun_retry or 0) > 0:
+                # Re-instruction after a balk: push concrete, do-it-now steps so the cold
+                # (diagnosis-skipped) customer actually performs the action this time.
+                parts.append("- The customer hesitated last time. Give a concrete, do-it-now "
+                             "instruction with the exact Settings path, and ask them to "
+                             "perform it now and report the result — do not offer to skip.")
+            if parts:
+                focus = "\n".join(parts)
         instr = self._phrase_instruction(subtask, chosen, state, focus=focus)
         if _SAGE_ON:
             _max_pi, _bs, _go, _det = self._sage_belief(state.family, subtask["subtask_type"], state)
@@ -1145,6 +1548,7 @@ class SchemaUserAgent(SchemaSoloAgent):
             "subtask": subtask["name"],
             "subtask_type": subtask["subtask_type"],
             "tool_name": tool_name,
+            "shotgun": shot_ba is not None,
         }
         state.pending_kind = "user"
         _state_log({"kind": "exec", "task_id": tid, "subtask": subtask["name"],

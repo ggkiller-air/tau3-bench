@@ -28,6 +28,14 @@ from tau2.utils.llm_utils import generate
 
 GLOBAL_USER_SIM_GUIDELINES_DIR = DATA_DIR / "tau2" / "user_simulator"
 
+# Source-level robustness: a transient empty completion from the user-sim LLM
+# (no content AND no tool_calls) would fail UserMessage.validate() and abort the
+# whole simulation as INFRASTRUCTURE_ERROR. Retry a few times (handles transient
+# API hiccups), then fall back to a minimal clarification (handles a deterministic
+# empty) so the simulation continues instead of dying.
+_USER_EMPTY_RETRIES = 2
+_USER_EMPTY_FALLBACK = "Sorry, I didn't catch that — could you repeat the last step?"
+
 
 GLOBAL_USER_SIM_GUIDELINES_PATH = (
     GLOBAL_USER_SIM_GUIDELINES_DIR / "simulation_guidelines.md"
@@ -231,16 +239,37 @@ class UserSimulator(
             state.messages.append(message)
         messages = state.system_messages + state.flip_roles()
 
-        # Generate response
-        assistant_message = generate(
-            model=self.llm,
-            messages=messages,
-            tools=self.tools,
-            call_name="user_simulator_response",
-            **self.llm_args,
-        )
+        # Generate response — retry on empty completions (a transient micuapi / LLM
+        # hiccup occasionally returns a message with no content and no tool_calls,
+        # which would fail UserMessage.validate() and abort the whole simulation as
+        # an INFRASTRUCTURE_ERROR).
+        def _is_empty(m) -> bool:
+            return not (m.content and m.content.strip()) and not m.tool_calls
+
+        assistant_message = None
+        for _attempt in range(_USER_EMPTY_RETRIES + 1):
+            assistant_message = generate(
+                model=self.llm,
+                messages=messages,
+                tools=self.tools,
+                call_name="user_simulator_response",
+                **self.llm_args,
+            )
+            if not _is_empty(assistant_message):
+                break
+            logger.warning(
+                f"User simulator returned an empty message "
+                f"(attempt {_attempt + 1}/{_USER_EMPTY_RETRIES + 1}); retrying."
+            )
 
         user_response = assistant_message.content
+        if _is_empty(assistant_message):
+            # still empty after retries → keep the simulation alive with a
+            # clarification instead of crashing it into INFRASTRUCTURE_ERROR.
+            user_response = _USER_EMPTY_FALLBACK
+            logger.warning(
+                "User simulator still empty after retries; using clarification fallback."
+            )
         logger.debug(f"Response: {user_response}")
 
         user_message = UserMessage(
