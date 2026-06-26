@@ -324,6 +324,7 @@ _ROLE_BY_CALL = {
     "schema_macro_init": "macro",
     "schema_executor": "executor",
     "schema_state_updater": "updater",
+    "schema_state_updater_hi": "updater_hi",  # L-HILO: big-model StateUpdater corrections (split for $)
 }
 
 
@@ -345,10 +346,11 @@ def _record_tokens(task_id: str, call_name: str, msg, sim_seed=None) -> None:
     key = f"{task_id}␟{sim_seed}" if sim_seed is not None else task_id
     rec = _SCHEMAFLEX_TOKENS.setdefault(key, {
         "task_id": task_id, "seed": sim_seed,
-        "macro": 0, "executor": 0, "updater": 0, "prompt": 0, "completion": 0, "calls": 0,
+        "macro": 0, "executor": 0, "updater": 0, "updater_hi": 0,
+        "prompt": 0, "completion": 0, "calls": 0,
         "peak_prompt": 0, "peak_prompt_exec": 0,
     })
-    rec[role] += p + c          # per-role total (prompt+completion)
+    rec[role] = rec.get(role, 0) + p + c   # per-role total (prompt+completion); robust to new roles
     rec["prompt"] += p          # run-level prompt total (the cacheable bulk)
     rec["completion"] += c
     rec["calls"] += 1

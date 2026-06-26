@@ -226,3 +226,4 @@ data/simulations/.credentials/
 .cursor/
 
 CLAUDE.md
+.env

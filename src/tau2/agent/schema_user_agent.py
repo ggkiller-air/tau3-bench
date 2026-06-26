@@ -328,6 +328,95 @@ _ELICIT_ON = os.environ.get("SCHEMAFLEX_ELICIT", "") not in ("", "0", "false", "
 # Gated by SCHEMAFLEX_SEQ; OFF = byte-identical.
 _SEQ_ON = os.environ.get("SCHEMAFLEX_SEQ", "") not in ("", "0", "false", "False")
 
+# --------------------------------------------------------------------------- #
+# Replan-failure fixes (diagnosed on strat90_replan = 60/90 user-mode). The
+# schema was authored from the SOLO tech-support doc, where the agent runs every
+# device tool itself and reads the result in the same turn. In USER-mode those
+# tools are user-side: the agent must instruct → read the customer's reply →
+# verify. The solo-authored schema never modeled that seam. Each flag below is an
+# independent lever; OFF = byte-identical (project ablation convention).
+# --------------------------------------------------------------------------- #
+# L-PROV: action-level provenance for the family GOAL field. FIX subtasks are
+# "fix + retest" compounds (e.g. FIX_NETWORK_MODE = [set_network_mode, run_speed_test])
+# and allow-list the goal field (speed_test / can_send_mms). The StateUpdater
+# reacting to the reply to the FIX action (set_network_mode) writes
+# speed_test='excellent' BEFORE run_speed_test is ever issued → phantom-satisfies
+# success_when_all → the proactive close latches `resolved` → the agent freezes on
+# the closing line → the customer (who never ran a speed test) refuses → OOS /
+# hard-zero (4/30 mobile_data fails). PROV drops a write to a goal field unless
+# the just-instructed action IS that field's dedicated verify tool, forcing the
+# real run_speed_test / can_send_mms round-trip the user-mode doc requires.
+_PROV_ON = os.environ.get("SCHEMAFLEX_PROV", "") not in ("", "0", "false", "False")
+
+# L-UNLATCH: `resolved` is a latch with no un-set path — once the proactive close
+# sets it, every later turn returns the canned closing line to max_steps. If the
+# customer keeps talking after a PROACTIVE close (they didn't ###STOP### → they do
+# not agree it is fixed), clear `resolved` + the goal fields and re-open
+# verification so the walk resumes. Defense-in-depth behind PROV.
+_UNLATCH_ON = os.environ.get("SCHEMAFLEX_UNLATCH", "") not in ("", "0", "false", "False")
+
+# L-WATCHDOG: episode-level no-progress guard. The per-subtask `stuck` counter is
+# keyed on subtask NAME, so REPLAN-thrash (a different subtask each turn) never
+# accumulates it → give-up never fires → max_steps. WATCHDOG escalates after
+# _WATCHDOG_REPEAT identical consecutive instructions (verbatim deadlock) and
+# after _WATCHDOG_STALL turns with no goal-field advance (thrash / depth-collapse).
+# It bounds wasted turns (an efficiency / $ guard); it does not by itself recover
+# reward on a task that was not converging.
+_WATCHDOG_ON = os.environ.get("SCHEMAFLEX_WATCHDOG", "") not in ("", "0", "false", "False")
+_WATCHDOG_REPEAT = int(os.environ.get("SCHEMAFLEX_WATCHDOG_REPEAT", "3"))  # nth identical re-emit → stop
+_WATCHDOG_STALL = int(os.environ.get("SCHEMAFLEX_WATCHDOG_STALL", "15"))   # frozen turns (no goal/subtask motion) → stop
+
+# L-REPLY: feed the customer's last reply into _phrase_instruction so a re-ask
+# answers their concrete question (e.g. supply the literal app name "messaging")
+# instead of re-emitting verbatim; also pins the literal app-name grounding on the
+# NORMAL walk (previously shotgun-only) for the mms permission deadlock.
+_REPLY_ON = os.environ.get("SCHEMAFLEX_REPLY", "") not in ("", "0", "false", "False")
+
+# L-HILO: high-low collaboration. The 8B StateUpdater is the proven bottleneck —
+# an offline study (gpt-5.4 oracle) found ~19% of high-consequence extractions are
+# CONSEQUENTIALLY wrong (writes resolved from a failure, mis-targets a field, drops
+# a co-field, mis-grades a value), and these are CONFIDENT errors (self-consistency
+# sampling caught only ~13%, so SAGE-style model-uncertainty does NOT fit). So HILO
+# routes only the LOAD-BEARING extractions to a big model: (Tier 1) the terminal
+# VERIFY/RETEST extractions that gate the close, always; (Tier 2) elsewhere, only
+# when a cheap structural check flags an obvious 8B error. The 8B still does the
+# instruction phrasing (Executor) and the majority of extractions — it stays the
+# workhorse; the big model is a sparse corrector. OFF = byte-identical.
+_HILO_ON = os.environ.get("SCHEMAFLEX_HILO", "") not in ("", "0", "false", "False")
+_HILO_LLM = os.environ.get("SCHEMAFLEX_HILO_LLM", "openai/gpt-5.4")
+_HILO_BASE = os.environ.get("SCHEMAFLEX_HILO_BASE", "")  # "" → litellm uses OPENAI_API_BASE (.env proxy)
+_HILO_MAX = int(os.environ.get("SCHEMAFLEX_HILO_MAX", "12"))  # per-episode big-model correction budget
+_HILO_VERIFY = set(
+    (os.environ.get("SCHEMAFLEX_HILO_VERIFY")
+     or "VERIFY_SPEED,VERIFY_MMS,VERIFY_SERVICE,RETEST_MMS,"
+        "FIX_STORAGE_PERM,FIX_SMS_PERM,FIX_NETWORK_MODE_MMS,FIX_WIFI_CALLING").split(",")
+)  # Tier-1 load-bearing subtasks: always big-model extraction. Covers the terminal
+#    verify/retest (close-critical) AND the mms repair zone (perm/wifi-calling/net-mode
+#    extractions that feed can_send_mms), where the offline study found the 8B's
+#    catastrophic drops (missed mms_sms_perm, wrong-field). Tunable via env.
+
+# Cheap structural-error signals for the Tier-2 gate (refined on the offline study:
+# ~47% hit / 3% FP on the obvious bias errors the 8B makes). They catch confident
+# mistakes self-consistency can't; the semantic misses (co-field/value-grade) are
+# covered by Tier-1 consequence routing instead.
+_HILO_RESULT_KW = re.compile(
+    r"\b(mbps|signal|shows?|status|bar|excellent|good|fair|poor|no connection|connection|"
+    r"fail(ed)?|active|connected|sim|airplane|wi-?fi|roaming|granted|permission|sent|deliver|"
+    r"message|did that|now|i (turned|ran|checked|granted|reset|reboot|enabled|disabled|tried|set|gave|changed))\b",
+    re.I,
+)
+_HILO_PURE_Q = re.compile(
+    r"\b(could you|can you|which|what do you mean|not sure which|before i|please (tell|specify|clarify)|"
+    r"do you want|should i|tell me which|which (exact )?app)\b",
+    re.I,
+)
+_HILO_FAIL = re.compile(
+    r"\b(still (can'?t|not|isn'?t)|can'?t send|did(n'?t| not) (work|send)|failed|no connection|not excellent)\b",
+    re.I,
+)
+_HILO_SUCCESS_VALS = {"speed_test": {"excellent"}, "can_send_mms": {True, "true", "True"},
+                      "service_status": {"connected"}, "resolved": {True, "true", "True"}}
+
 _ELICIT_SYSTEM = """You are a friendly telecom support agent. Before you can apply a fix, you need ONE piece of authorization or context from the customer that only they can give (e.g. permission to charge an overdue bill, or whether they are currently travelling abroad). Write ONE short, friendly yes/no question that obtains exactly that — name the concrete thing (the specific bill, the specific action). Do NOT explain steps or list options; just ask the single question. Output only the question text."""
 
 _ELICIT_USER = """You need the customer's: {field}
@@ -397,6 +486,12 @@ class SchemaUserAgentState(SchemaSoloAgentState):
     shotgun_retry: int = 0  # L-SHOTGUN: re-instruct count for the current step (until it lands)
     elicited: list = []  # L-ELICIT: context-precondition fields already asked of the user
     acted: dict = {}  # L-SEQ: subtask name -> base_action tools already dispatched this activation
+    closed_proactively: bool = False  # L-UNLATCH: `resolved` was set by the proactive close, not a VERIFY
+    last_instr: Optional[str] = None  # L-WATCHDOG: last instruction text emitted (verbatim-repeat detector)
+    instr_repeat: int = 0  # L-WATCHDOG: consecutive identical re-emits
+    stall_turns: int = 0  # L-WATCHDOG: user-reply turns since the goal field last advanced
+    last_user_reply: Optional[str] = None  # L-REPLY: the customer's most recent free-text reply
+    hilo_calls: int = 0  # L-HILO: big-model StateUpdater corrections spent this episode (budget cap)
 
 
 class SchemaUserAgent(SchemaSoloAgent):
@@ -527,6 +622,33 @@ class SchemaUserAgent(SchemaSoloAgent):
                 if m not in out:
                     out.append(m)
         return out
+
+    def _verify_field_tools(self) -> dict:
+        """L-PROV map: {goal_field -> the single tool that actually measures it},
+        auto-derived from the schema (each VERIFY_* subtask with exactly one
+        base_action whose tool is a dedicated measurement read). Restricted to
+        run_speed_test / can_send_mms: those are pure measurements no FIX surfaces
+        as a side effect. service_status is intentionally excluded — fixes
+        legitimately surface it via the status bar, and the service family is at
+        ceiling, so gating it would only add risk. Derived, not hand-mapped, so it
+        carries to a re-generated schema (auto schema-gen north star)."""
+        cache = getattr(self, "_vft_cache", None)
+        if cache is not None:
+            return cache
+        m = {}
+        for name, spec in self.subtask_spec.items():
+            if not str(name).startswith("VERIFY"):
+                continue
+            bas = spec.get("base_actions") or []
+            if len(bas) != 1:
+                continue
+            tool = bas[0].get("tool")
+            if tool not in ("run_speed_test", "can_send_mms"):
+                continue
+            for f in self._dwa_fields(name):
+                m[f] = tool
+        self._vft_cache = m
+        return m
 
     def _sage_belief(self, family, subtask_type, state):
         """Belief / EVPI / redundancy-cost over a subtask's elicitation aspects.
@@ -1237,6 +1359,61 @@ class SchemaUserAgent(SchemaSoloAgent):
         _record_tokens(getattr(self.task, "id", "?"), "schema_executor", msg, sim_seed=getattr(self, "_seed", None))
         return (msg.content or "").strip() or "Could you try that step and tell me what you see?"
 
+    def _hi_gen_kwargs(self) -> dict:
+        """Generation kwargs for the big-model corrector: temp 0, proxy base. Unlike
+        _gen_kwargs it does NOT carry the local-vLLM api_base or the Qwen
+        thinking-disable extra_body — the big model is reached via OPENAI_API_BASE
+        (.env proxy) unless SCHEMAFLEX_HILO_BASE overrides it."""
+        kw = {"temperature": 0.0}
+        if _HILO_BASE:
+            kw["api_base"] = _HILO_BASE
+        return kw
+
+    def _run_state_updater(self, messages, model, gen_kwargs, call_name, tid):
+        """One StateUpdater extraction with JSON-retry. Returns parsed patch_ops or None."""
+        ops, msgs = None, messages
+        for _ in range(_JSON_RETRIES + 1):
+            msg = generate(model=model, messages=msgs, call_name=call_name, **gen_kwargs)
+            _record_tokens(tid, call_name, msg, sim_seed=getattr(self, "_seed", None))
+            ops = _parse_patch_ops(msg.content or "")
+            if ops is not None:
+                break
+            msgs = msgs + [
+                AssistantMessage(role="assistant", content=msg.content or ""),
+                UserMessage(role="user", content='Invalid. Return ONLY {"patch_ops": [...]} on the allowed paths.'),
+            ]
+        return ops
+
+    def _extraction_suspect(self, reply, ops):
+        """Cheap structural check (no LLM): does the 8B's patch_ops look like a
+        CONFIDENT mis-extraction? Returns a tag or None. Refined on the offline study
+        to ~47% hit / 3% FP on the obvious bias errors."""
+        norm = {}
+        for o in ops or []:
+            if isinstance(o, dict) and o.get("op") == "set":
+                norm[_field(str(o.get("path", "")))] = o.get("value")
+        rl = reply or ""
+        if norm.get("resolved") in (True, "true", "True"):
+            return "resolved_true"              # StateUpdater must never set resolved
+        has_q = bool(_HILO_PURE_Q.search(rl))
+        has_obs = bool(_HILO_RESULT_KW.search(rl))
+        if norm and has_q and not has_obs:
+            return "nonanswer_write"            # wrote from a pure question/refusal
+        if not norm and has_obs and not has_q:
+            return "empty_on_substantive"       # under-extraction from a real observation
+        if _HILO_FAIL.search(rl) and any(norm.get(k) in v for k, v in _HILO_SUCCESS_VALS.items()):
+            return "false_success"              # success value while the reply states failure
+        return None
+
+    def _hilo_route(self, subtask_type, reply, ops_8b, state):
+        """Decide whether to spend a big-model correction on this extraction.
+        Returns a route tag or None. Budget-capped per episode (8B stays workhorse)."""
+        if state.hilo_calls >= _HILO_MAX:
+            return None
+        if subtask_type in _HILO_VERIFY:
+            return "verify"                     # Tier 1: close-critical extraction, always
+        return self._extraction_suspect(reply, ops_8b)  # Tier 2: structural gate elsewhere
+
     def _update_from_user_reply(self, subtask_type, subtask_name, action_name, reply_text, state) -> None:
         """StateUpdater for a customer's free-text reply (dialogue variant).
 
@@ -1251,6 +1428,18 @@ class SchemaUserAgent(SchemaSoloAgent):
         allowed = (spec.get("patch_ops_policy", {}) or {}).get("allowed", [])
         if not allowed:
             return
+        if _PROV_ON:
+            # Action-level provenance: a goal/verification field may only be written
+            # by the StateUpdater reacting to its OWN measurement tool. Reacting to a
+            # FIX action (set_network_mode, grant_app_permission, …) it is dropped, so
+            # speed_test/can_send_mms cannot be phantom-set before the retest runs.
+            vft = self._verify_field_tools()
+            block = {f for f, t in vft.items() if action_name != t}
+            if block:
+                allowed = [a for a in allowed
+                           if not (isinstance(a, dict) and _field(str(a.get("path", ""))) in block)]
+                if not allowed:
+                    return
         fam_enums = (
             (self.task_spec.get(state.family, {}).get("task_state_schema", {}) or {}).get("enums", {})
         )
@@ -1277,20 +1466,23 @@ class SchemaUserAgent(SchemaSoloAgent):
             SystemMessage(role="system", content=_STATE_UPDATER_SYSTEM_USER),
             UserMessage(role="user", content=user),
         ]
-        ops = None
-        for _ in range(_JSON_RETRIES + 1):
-            msg = generate(
-                model=self.llm, messages=messages,
-                call_name="schema_state_updater", **self._gen_kwargs(),
-            )
-            _record_tokens(getattr(self.task, "id", "?"), "schema_state_updater", msg, sim_seed=getattr(self, "_seed", None))
-            ops = _parse_patch_ops(msg.content or "")
-            if ops is not None:
-                break
-            messages = messages + [
-                AssistantMessage(role="assistant", content=msg.content or ""),
-                UserMessage(role="user", content='Invalid. Return ONLY {"patch_ops": [...]} on the allowed paths.'),
-            ]
+        tid = getattr(self.task, "id", "?")
+        # 8B does the extraction (workhorse). L-HILO: on load-bearing extractions
+        # (Tier-1 terminal verify, or Tier-2 structural-flagged 8B errors) a big model
+        # re-extracts and overrides — sparse, budget-capped, token-split for $.
+        ops = self._run_state_updater(messages, self.llm, self._gen_kwargs(), "schema_state_updater", tid)
+        hilo_route = None
+        if _HILO_ON:
+            hilo_route = self._hilo_route(subtask_type, reply_text, ops or [], state)
+            if hilo_route:
+                ops_hi = self._run_state_updater(
+                    messages, _HILO_LLM, self._hi_gen_kwargs(), "schema_state_updater_hi", tid)
+                if ops_hi is not None:
+                    state.hilo_calls += 1
+                    _state_log({"kind": "hilo", "task_id": tid, "subtask_type": subtask_type,
+                                "action": action_name, "route": hilo_route,
+                                "ops_8b": ops, "ops_hi": ops_hi, "n_hilo": state.hilo_calls})
+                    ops = ops_hi
         written = _apply_patch_ops(state.task_state, ops or [], allowed, fam_enums)
         _state_log({
             "kind": "update", "task_id": getattr(self.task, "id", "?"),
@@ -1327,6 +1519,7 @@ class SchemaUserAgent(SchemaSoloAgent):
         if isinstance(message, UserMessage):
             state.messages.append(message)
             text = message.content or ""
+            state.last_user_reply = text  # L-REPLY: surface to the next instruction phrasing
             if state.pending_kind == "await_phone":
                 self._parse_phone(text, state)
                 state.pending = None
@@ -1348,6 +1541,9 @@ class SchemaUserAgent(SchemaSoloAgent):
                 state.pending_kind = None
             elif state.pending is not None and state.pending_kind == "user":
                 pend = state.pending
+                _gf = self._pred_fields(self._family_spec(state).get("success_when_all", []))
+                _goal_before = {f: state.task_state.get(f) for f in _gf}
+                _sk_done_before = state.subtask_done.get(pend["subtask"], False)
                 written = self._update_from_user_reply(
                     pend["subtask_type"], pend["subtask"], pend["tool_name"], text, state
                 )
@@ -1367,6 +1563,16 @@ class SchemaUserAgent(SchemaSoloAgent):
                     state.stuck[sk] = 0  # made progress; reset
                 else:
                     state.stuck[sk] = state.stuck.get(sk, 0) + 1  # refused / vague
+                if _WATCHDOG_ON:
+                    # Episode-level anti-hang backstop: count turns with NO real
+                    # forward motion. "Motion" = the goal field's VALUE changed (a new
+                    # measurement, incl. poor→excellent) OR the pending subtask just
+                    # completed. This resets on genuine progress (so a slow legit deep
+                    # task is NOT cut), and only climbs when the episode is truly frozen
+                    # with varied-but-empty turns the verbatim-repeat guard can't catch.
+                    _adv = any(_goal_before.get(f) != state.task_state.get(f) for f in _gf) \
+                        or (state.subtask_done.get(sk) and not _sk_done_before)
+                    state.stall_turns = 0 if _adv else state.stall_turns + 1
                 # SAGE aspect history n_a: count this elicitation against every
                 # done_when_all aspect the reply left unfilled.
                 for f in self._dwa_fields(pend["subtask_type"]):
@@ -1412,6 +1618,16 @@ class SchemaUserAgent(SchemaSoloAgent):
                     state.acted.pop(pend["subtask"], None)  # L-SEQ: re-opened → re-dispatch its actions
                     state.active_subtask = None
 
+        # ESCALATION is terminal: once transfer_to_human_agents has been dispatched
+        # (supervisor or WATCHDOG), do NOT re-enter the walk — it would re-select the
+        # same subtask, re-emit the same instruction, and re-escalate every turn to
+        # max_steps. Emit the policy hand-off line and yield so the user simulator can
+        # ###TRANSFER###/stop. (Latent before WATCHDOG: _escalate had no other heavy caller.)
+        if state.task_state.get("escalated"):
+            return self._say(
+                "You are being transferred to a human agent. Please hold on.", state
+            )
+
         # 2) BOOTSTRAP: we need the phone number before the schema walk can run.
         if not state.task_state.get("phone_number"):
             state.asked_phone = True
@@ -1430,10 +1646,31 @@ class SchemaUserAgent(SchemaSoloAgent):
         #    env_assertions) — turning an already-solved task into reward 0.
         #    Keys off success_when_all = the exact eval criterion, so a true
         #    predicate means the goal state is genuinely reached.
+        if (_UNLATCH_ON and isinstance(message, UserMessage)
+                and state.task_state.get("resolved") and state.closed_proactively):
+            # The proactive close declared victory, but the customer is still talking
+            # (they did not ###STOP###) → they do not agree it is fixed. Clear the
+            # latch + the goal fields and re-open the verifying subtasks so the walk
+            # resumes a real verification instead of repeating the closing line.
+            _swa_fields = self._pred_fields(self._family_spec(state).get("success_when_all", []))
+            for f in _swa_fields:
+                state.task_state[f] = None
+            state.task_state["resolved"] = False
+            state.closed_proactively = False
+            for _name in list(state.subtask_done.keys()):
+                _stype = (self._subtask_by_name(state, _name) or {}).get("subtask_type", "")
+                if set(self._dwa_fields(_stype)) & set(_swa_fields):
+                    state.subtask_done.pop(_name, None)
+                    state.acted.pop(_name, None)
+            state.active_subtask = None
+            _state_log({"kind": "unlatch", "task_id": tid, "cleared": _swa_fields,
+                        "task_state": dict(state.task_state)})
+
         if not state.task_state.get("resolved") and state.repair_attempted:
             _swa = self._family_spec(state).get("success_when_all", [])
             if _swa and eval_pred(_swa, state.task_state):
                 state.task_state["resolved"] = True
+                state.closed_proactively = True  # L-UNLATCH: distinguish from a VERIFY-driven close
                 _state_log({"kind": "close", "task_id": tid, "reason": "goal_satisfied",
                             "success_when_all": _swa, "task_state": dict(state.task_state)})
         if state.task_state.get("resolved"):
@@ -1442,6 +1679,18 @@ class SchemaUserAgent(SchemaSoloAgent):
             return self._say(
                 "Great news — that should be fully resolved now. Is there anything else I can help you with?",
                 state,
+            )
+
+        # L-WATCHDOG stall: no goal-field advance for too many turns (REPLAN-thrash /
+        # depth-collapse). Bound the wasted turns with an escalate rather than grinding
+        # to max_steps — the task was not converging in dialogue. Efficiency ($) guard.
+        if _WATCHDOG_ON and state.stall_turns >= _WATCHDOG_STALL:
+            _state_log({"kind": "watchdog", "task_id": tid, "reason": "stall",
+                        "turns": state.stall_turns, "task_state": dict(state.task_state)})
+            return self._escalate(
+                "Unable to resolve the issue within the live session after repeated attempts; "
+                "escalating to a human agent.",
+                state, tid,
             )
 
         # 4) Pick the next subtask; abandon any whose elicitation is no longer
@@ -1599,7 +1848,40 @@ class SchemaUserAgent(SchemaSoloAgent):
                              "perform it now and report the result — do not offer to skip.")
             if parts:
                 focus = "\n".join(parts)
+        if _REPLY_ON:
+            extra = []
+            # App-name grounding on the NORMAL walk (shotgun branch already pins it):
+            # the device app is literally "messaging"; the user-sim rejects "Messages".
+            if shot_ba is None and tool_name in ("check_app_permissions", "grant_app_permission"):
+                extra.append('- The app is named exactly "messaging" (all lowercase). There is no '
+                             'app called "Messages" — tell the customer to open the app named "messaging".')
+            # Re-ask injection: after a balk, answer the customer's actual question
+            # (give the exact name/value they asked for) instead of repeating verbatim.
+            if state.last_user_reply and state.stuck.get(subtask["name"], 0) > 0:
+                _r = state.last_user_reply.strip().replace("\n", " ")[:200]
+                extra.append(f'- The customer just said: "{_r}". Answer their specific question or '
+                             'concern directly and concretely; do NOT repeat your previous instruction verbatim.')
+            if extra:
+                focus = (focus + "\n" + "\n".join(extra)) if focus else "\n".join(extra)
         instr = self._phrase_instruction(subtask, chosen, state, focus=focus)
+        if _WATCHDOG_ON and shot_ba is None:
+            # Verbatim-deadlock guard: the same instruction re-emitted N times means
+            # the customer will not act on it (e.g. demanding a value we keep not
+            # giving). Stop instead of looping to max_steps.
+            if instr == state.last_instr:
+                state.instr_repeat += 1
+            else:
+                state.instr_repeat = 0
+                state.last_instr = instr
+            if state.instr_repeat >= _WATCHDOG_REPEAT:
+                _state_log({"kind": "watchdog", "task_id": tid, "reason": "instr_repeat",
+                            "count": state.instr_repeat, "subtask": subtask["name"],
+                            "task_state": dict(state.task_state)})
+                return self._escalate(
+                    "Unable to complete troubleshooting in dialogue (repeated the same step "
+                    "without progress); escalating to a human agent.",
+                    state, tid,
+                )
         if _SAGE_ON:
             _max_pi, _bs, _go, _det = self._sage_belief(state.family, subtask["subtask_type"], state)
             _state_log({"kind": "sage_belief", "task_id": tid, "subtask": subtask["name"],
