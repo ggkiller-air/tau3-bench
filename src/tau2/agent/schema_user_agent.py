@@ -329,6 +329,31 @@ _ELICIT_ON = os.environ.get("SCHEMAFLEX_ELICIT", "") not in ("", "0", "false", "
 _SEQ_ON = os.environ.get("SCHEMAFLEX_SEQ", "") not in ("", "0", "false", "False")
 
 # --------------------------------------------------------------------------- #
+# L-THRU: compound-mms THROUGHPUT lever (batched family-retest, generalizes DIAG).
+# Ported from the `replan` branch (徐乐礼) onto this HILO base to attack the stated
+# step-budget bottleneck of deep compound mms. VERIFY_MMS/RETEST_MMS both produce the
+# goal-core `can_send_mms` (+resolved) → tier-3 in _priority, and VERIFY_MMS's entry
+# `when` is just `resolved == false` so it is eligible from turn 1. Once any repair
+# runs (`_any_repair_done`), this always-eligible retest claims tier-3 and STARVES the
+# tier-2 informative diagnostics that reveal WHICH of the 7-11 compound faults remain,
+# looping can_send_mms on an AND-gate that can't flip until every layer is fixed →
+# wastes the step budget. L-THRU (mms-only): once the gate has been measured failing
+# at least once (v2 gate; SCHEMAFLEX_THRU_V1 makes it fire unconditionally = the
+# strat90-0.707 incumbent) AND a live informative diagnostic still pends, demote the
+# goal-retest from tier-3 to tier-2 so EVERY informative diagnostic + the repairs they
+# unlock run BEFORE the gate is re-measured — then one retest closes. It does NOT skip
+# diagnostics and does NOT touch repair priority. NOTE (multi-trial verdict, see
+# CLAUDE.md §4.3): the sibling L-FRT/L-STEP (per-fix retest suppression + balk-rephrase)
+# were NET-HARMFUL on deep compound mms — L-FRT ≡ wzh's reverted DEFER ("per-fix retests
+# are load-bearing"), so they are deliberately NOT ported here. Only L-THRU is.
+# Gated by SCHEMAFLEX_THRU; OFF = byte-identical.
+_THRU_ON = os.environ.get("SCHEMAFLEX_THRU", "") not in ("", "0", "false", "False")
+# THRU-v1 toggle: demotion fires UNCONDITIONALLY whenever an informative diagnostic
+# pends (the Round-3 batching that scored strat90 0.707 multi-trial) instead of the v2
+# "only after one measured failure" gate. Default off → v2.
+_THRU_V1 = os.environ.get("SCHEMAFLEX_THRU_V1", "") not in ("", "0", "false", "False")
+
+# --------------------------------------------------------------------------- #
 # Replan-failure fixes (diagnosed on strat90_replan = 60/90 user-mode). The
 # schema was authored from the SOLO tech-support doc, where the agent runs every
 # device tool itself and reads the result in the same turn. In USER-mode those
@@ -1015,6 +1040,23 @@ class SchemaUserAgent(SchemaSoloAgent):
                 return True  # a fresh diagnostic can still reveal a different repair
         return False
 
+    def _diag_pending(self, state, idx, needed):
+        """L-THRU: a still-pending, live, INFORMATIVE (non-repair) diagnostic exists —
+        running it would write a needed-but-unknown field and thus unlock/route a repair.
+        When true, the mms goal-retest is held BELOW the diagnostics (tier-2) so the
+        AND-gate `can_send_mms` is measured only after the fault frontier is fully
+        explored — killing the always-eligible VERIFY_MMS retest loop that starves
+        diagnostics. Unlike DIAG's _retest_exhausted, no 'goal already measured' gate,
+        so the very first premature retest is suppressed too. mms-family use only."""
+        ts = state.task_state
+        seq = self._family_spec(state)["base_subtask_sequence"]
+        for st in seq:
+            if idx["is_repair"][st["subtask_type"]] or state.subtask_done.get(st["name"]):
+                continue
+            if self._informative(state, idx, needed, st) and self._when_live(st.get("when", "always"), ts):
+                return True
+        return False
+
     def _priority(self, state, idx, needed, subtask):
         """4 tiers (high→low), tie-broken by original positional order (stable, so
         ON==OFF absent a higher tier):
@@ -1037,6 +1079,13 @@ class SchemaUserAgent(SchemaSoloAgent):
             elif prod & goal_core:
                 if _DIAG_ON and self._retest_exhausted(state, idx, needed):
                     tier = 1  # already retested & still failing → yield to pending diagnostics
+                elif (_THRU_ON and state.family == "mms"
+                      and (_THRU_V1 or any(state.task_state.get(f) is not None for f in goal_core))
+                      and self._diag_pending(state, idx, needed)):
+                    # L-THRU: batch the AND-gate retest BELOW diagnostics until the fault
+                    # frontier is explored. v2 requires one measured failure first (so a
+                    # single-fault mms still closes eagerly); v1 fires unconditionally.
+                    tier = 2
                 else:
                     tier = 3  # the right closer for THIS family
             else:
