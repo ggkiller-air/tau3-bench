@@ -227,3 +227,6 @@ data/simulations/.credentials/
 
 CLAUDE.md
 .env
+
+# 本地清理回收站（确认无误后可整目录 rm -rf）
+_trash*/

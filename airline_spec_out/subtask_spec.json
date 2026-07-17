@@ -1,0 +1,919 @@
+{
+  "__about__": "Airline subtask primitives for schema_airline_user_agent. AGENT-side actions (tool is a real airline tool: get_user_details, get_reservation_details, cancel_reservation, send_certificate, update_reservation_baggages, transfer_to_human_agents) are executed directly and parsed from the tool's JSON. USER-side actions use PSEUDO tool names NOT in the agent's tool set (ask_user_id, ask_reservation_id, ask_intent, ask_cancel_reason, confirm_cancel, ask_compensation_facts, offer_compensation, ask_baggage, confirm_baggage, state_refusal) so _classify routes them to a customer message; the customer's free-text reply is parsed via the dialogue StateUpdater (parse_rules become hints + allowed-path/enum guidance). Policy logic (eligibility, amounts) is baked into parse_rules because the schema, not the model, owns the procedure.",
+  "IDENTIFY_USER": {
+    "goal_template": "identify the customer by user id and load their profile (membership)",
+    "reads": [
+      "user_id"
+    ],
+    "base_actions": [
+      {
+        "tool": "ask_user_id",
+        "args": {},
+        "when": "task_state.user_id == null"
+      },
+      {
+        "tool": "get_user_details",
+        "args": {
+          "user_id": "<task_state.user_id>"
+        },
+        "when": "the customer has given a user id but the profile is not loaded yet"
+      }
+    ],
+    "executor_sys_rules": [
+      "If you do not yet have the customer's user id, ask them for it (a handle like 'emma_kim_9957'). Ask for nothing else.",
+      "Once you have the user id, call get_user_details with that exact user_id to load their profile."
+    ],
+    "parse_rules": [
+      "If the customer states their user id (a lowercase name_number handle like 'emma_kim_9957'), set task_state.user_id to it.",
+      "From a get_user_details result (a JSON user object), set task_state.user_loaded=true, task_state.membership from its 'membership' field (regular/silver/gold), and task_state.user_reservations = its 'reservations' list copied verbatim (a JSON array of reservation-id strings). Also set task_state.cand_reservations to the SAME list (a working copy).",
+      "If get_user_details returned an error / 'not found', do NOT set user_loaded; leave it null.",
+      "Set task_state.user_payment_ids = the keys of the get_user_details 'payment_methods' object (a JSON array of ids like 'gift_card_123','credit_card_456','certificate_789')."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.user_id"
+        },
+        {
+          "op": "set",
+          "path": "task_state.user_loaded"
+        },
+        {
+          "op": "set",
+          "path": "task_state.membership"
+        },
+        {
+          "op": "set",
+          "path": "task_state.user_reservations"
+        },
+        {
+          "op": "set",
+          "path": "task_state.cand_reservations"
+        },
+        {
+          "op": "set",
+          "path": "task_state.user_payment_ids"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.user_loaded == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.user_loaded\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.membership\",\"value\":\"gold\"} ] }"
+  },
+  "ASK_INTENT": {
+    "goal_template": "find out what the customer wants to do",
+    "reads": [],
+    "base_actions": [
+      {
+        "tool": "ask_intent",
+        "args": {},
+        "when": "task_state.intent == null"
+      }
+    ],
+    "executor_sys_rules": [
+      "Ask the customer, in one short sentence, what they would like to do today (e.g. cancel a reservation, add checked bags, ask about compensation, change a flight)."
+    ],
+    "parse_rules": [
+      "Classify the customer's reply into task_state.intent: 'cancel' (cancel a reservation), 'compensation' (refund/certificate for a cancelled or delayed flight), 'modify_baggage' (add checked bags), 'book' (book a new trip), 'modify_flights' (change flights/dates), 'modify_cabin' (change cabin), 'modify_passengers' (change passenger info), else 'other'."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.intent"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.intent != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.intent\",\"value\":\"cancel\"} ] }"
+  },
+  "RESOLVE_RESERVATION": {
+    "goal_template": "find the right reservation by walking the user's reservation list when they don't know the id",
+    "reads": [
+      "cand_reservations",
+      "trip_origin",
+      "trip_dest"
+    ],
+    "base_actions": [
+      {
+        "tool": "get_reservation_details",
+        "args": {
+          "reservation_id": "<the FIRST id in task_state.cand_reservations>"
+        },
+        "when": "task_state.reservation_id == null and task_state.res_loaded == null"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call get_reservation_details with reservation_id = the FIRST id in task_state.cand_reservations. Do not ask the customer for an id here; you are searching their reservations to find the matching one.",
+      "Do not call any other tool here."
+    ],
+    "parse_rules": [
+      "Decide if the loaded reservation is the one the customer means: it matches if its 'origin'/'destination' correspond to task_state.trip_origin/trip_dest (city or IATA), OR if task_state.cand_reservations has only one id left (then it is the only candidate).",
+      "If it MATCHES: set task_state.reservation_id to this reservation's 'reservation_id', and capture task_state.res_loaded=true, res_status ('cancelled' if 'status'=='cancelled' else 'active'), res_cabin, res_insurance, res_trip_type (from 'flight_type'), res_passenger_count (len of 'passengers'), res_created_recent (true iff 'created_at' >= 2024-05-14T15:00:00), res_any_flown (true iff any flight 'date' < 2024-05-15 or status flying/landed; else false), and res_flights (the 'flights' as a JSON array of {flight_number,date}).",
+      "If it does NOT match and more candidates remain: set task_state.cand_reservations to the SAME list with its FIRST element removed; do NOT set reservation_id or res_loaded.",
+      "When it matches, also set task_state.res_origin = 'origin' and task_state.res_dest = 'destination'."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.reservation_id"
+        },
+        {
+          "op": "set",
+          "path": "task_state.cand_reservations"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_loaded"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_status"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_cabin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_insurance"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_trip_type"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_passenger_count"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_created_recent"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_any_flown"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_flights"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_origin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_dest"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.res_loaded == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.reservation_id\",\"value\":\"M05KNL\"}, {\"op\":\"set\",\"path\":\"task_state.res_loaded\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.res_cabin\",\"value\":\"economy\"}, {\"op\":\"set\",\"path\":\"task_state.res_flights\",\"value\":[{\"flight_number\":\"HAT110\",\"date\":\"2024-05-24\"}]} ] }"
+  },
+  "GET_RESERVATION": {
+    "goal_template": "load the reservation the customer is asking about and derive its policy-relevant facts",
+    "reads": [
+      "reservation_id"
+    ],
+    "base_actions": [
+      {
+        "tool": "ask_reservation_id",
+        "args": {},
+        "when": "task_state.reservation_id == null"
+      },
+      {
+        "tool": "get_reservation_details",
+        "args": {
+          "reservation_id": "<task_state.reservation_id>"
+        },
+        "when": "the customer has given a reservation id but the reservation is not loaded yet"
+      }
+    ],
+    "executor_sys_rules": [
+      "If you do not have the reservation id, ask the customer for their 6-character booking code (e.g. 'EHGLP3'). Ask for nothing else.",
+      "Once you have it, call get_reservation_details with that exact reservation_id."
+    ],
+    "parse_rules": [
+      "If the customer states a 6-character booking code, set task_state.reservation_id to it (uppercase).",
+      "From a get_reservation_details result (a JSON reservation object) set ALL of: task_state.res_loaded=true; task_state.res_status ('cancelled' if its 'status' is 'cancelled', else 'active'); task_state.res_cabin from 'cabin' (basic_economy/economy/business); task_state.res_insurance from 'insurance' (yes/no); task_state.res_trip_type from 'flight_type' (one_way/round_trip); task_state.res_passenger_count = the number of items in 'passengers'.",
+      "task_state.res_created_recent: true if 'created_at' is on or after 2024-05-14T15:00:00 (i.e. within 24 hours before the current time 2024-05-15T15:00:00), else false.",
+      "task_state.res_any_flown: true if ANY flight in 'flights' has a 'date' strictly before 2024-05-15, OR any segment status is 'flying' or 'landed'; else false. When in doubt and all flight dates are 2024-05-15 or later, set false.",
+      "task_state.res_flights: copy the reservation's 'flights' as a JSON array keeping ONLY each segment's flight_number and date, in order, e.g. [{\"flight_number\":\"HAT110\",\"date\":\"2024-05-24\"}, ...]. This exact array is reused when reassembling a flight/cabin change.",
+      "task_state.res_origin = the reservation 'origin' (IATA); task_state.res_dest = the reservation 'destination' (IATA)."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.reservation_id"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_loaded"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_status"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_cabin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_insurance"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_trip_type"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_passenger_count"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_created_recent"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_any_flown"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_flights"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_origin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_dest"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.res_loaded == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.res_loaded\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.res_cabin\",\"value\":\"economy\"}, {\"op\":\"set\",\"path\":\"task_state.res_origin\",\"value\":\"ATL\"}, {\"op\":\"set\",\"path\":\"task_state.res_dest\",\"value\":\"PHL\"}, {\"op\":\"set\",\"path\":\"task_state.res_flights\",\"value\":[{\"flight_number\":\"HAT110\",\"date\":\"2024-05-24\"}]} ] }"
+  },
+  "ASK_CANCEL_REASON": {
+    "goal_template": "get the cancellation reason and decide whether policy allows the cancellation",
+    "reads": [
+      "res_created_recent",
+      "res_cabin",
+      "res_insurance"
+    ],
+    "base_actions": [
+      {
+        "tool": "ask_cancel_reason",
+        "args": {},
+        "when": "task_state.cancel_reason == null or task_state.cancel_allowed == null"
+      }
+    ],
+    "executor_sys_rules": [
+      "Ask the customer the reason for the cancellation (change of plans, the airline cancelled the flight, a health reason, a weather reason, or other). Ask only this."
+    ],
+    "parse_rules": [
+      "Set task_state.cancel_reason from the reply: change_of_plan / airline_cancelled / health / weather / other.",
+      "Then set task_state.cancel_allowed using the cancellation policy. cancel_allowed = true if ANY of these holds: (a) task_state.res_created_recent == true (booked within the last 24h); (b) cancel_reason == 'airline_cancelled'; (c) task_state.res_cabin == 'business'; (d) task_state.res_insurance == 'yes' AND cancel_reason is 'health' or 'weather'. Otherwise cancel_allowed = false.",
+      "Set BOTH fields in the same response."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.cancel_reason"
+        },
+        {
+          "op": "set",
+          "path": "task_state.cancel_allowed"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.cancel_allowed != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.cancel_reason\",\"value\":\"change_of_plan\"}, {\"op\":\"set\",\"path\":\"task_state.cancel_allowed\",\"value\":false} ] }"
+  },
+  "CONFIRM_CANCEL": {
+    "goal_template": "confirm the cancellation with the customer before doing it",
+    "reads": [
+      "reservation_id"
+    ],
+    "base_actions": [
+      {
+        "tool": "confirm_cancel",
+        "args": {},
+        "when": "task_state.cancel_confirmed == null"
+      }
+    ],
+    "executor_sys_rules": [
+      "Tell the customer you can cancel reservation <task_state.reservation_id> and that any refund goes to the original payment method in 5-7 business days, then ask them to confirm with a yes. Do not cancel anything yet."
+    ],
+    "parse_rules": [
+      "Set task_state.cancel_confirmed=true if the customer agrees, says yes, says go ahead, or does NOT object to proceeding.",
+      "Set task_state.cancel_confirmed=false ONLY if the customer explicitly declines or says not to do it."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.cancel_confirmed"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.cancel_confirmed != null"
+    ],
+    "sys_output_format": "{\"patch_ops\": [{\"op\": \"set\", \"path\": \"task_state.cancel_confirmed\", \"value\": true}]}",
+    "confirm_template": "I'd like to confirm: cancel reservation {reservation_id}. Any refund returns to your original payment method in 5-7 business days. Shall I proceed? (yes/no)"
+  },
+  "DO_CANCEL": {
+    "goal_template": "cancel the reservation",
+    "reads": [
+      "reservation_id"
+    ],
+    "base_actions": [
+      {
+        "tool": "cancel_reservation",
+        "args": {
+          "reservation_id": "<task_state.reservation_id>"
+        },
+        "when": "task_state.cancel_confirmed == true and task_state.cancelled_done != true"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call cancel_reservation with reservation_id=<task_state.reservation_id> exactly once. The cancellation has already been confirmed and verified against policy."
+    ],
+    "parse_rules": [
+      "From the cancel_reservation result (a reservation object whose 'status' is now 'cancelled'), set task_state.cancelled_done=true and task_state.resolved=true.",
+      "If it returned an error, set neither."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.cancelled_done"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.resolved == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.cancelled_done\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "REFUSE_REQUEST": {
+    "goal_template": "decline a request that airline policy does not allow, politely and firmly",
+    "reads": [],
+    "base_actions": [
+      {
+        "tool": "state_refusal",
+        "args": {},
+        "when": "task_state.resolved == false"
+      }
+    ],
+    "executor_sys_rules": [
+      "Politely tell the customer that, under airline policy, you are unable to do what they asked, and briefly state the reason (e.g. the reservation is not eligible for cancellation, or they do not qualify for compensation). Do NOT perform any action and do NOT offer anything not allowed by policy. Hold firm if they push back with reasons that do not change the policy outcome.",
+      "Do not promise a human agent unless a transfer is actually warranted."
+    ],
+    "parse_rules": [
+      "After you have stated the refusal and the customer replies, set task_state.refused=true and task_state.resolved=true regardless of the reply, UNLESS the customer provides genuinely new information that would change the policy decision."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.refused"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.resolved == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.refused\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "CHECK_COMPENSATION": {
+    "goal_template": "confirm the facts of the complaint and decide compensation eligibility and amount",
+    "reads": [
+      "membership",
+      "res_insurance",
+      "res_cabin",
+      "res_passenger_count"
+    ],
+    "base_actions": [
+      {
+        "tool": "ask_compensation_facts",
+        "args": {},
+        "when": "task_state.comp_type == null or task_state.comp_eligible == null"
+      }
+    ],
+    "executor_sys_rules": [
+      "Ask the customer to confirm the facts of their complaint: which reservation/flight, and whether the flight was CANCELLED by the airline or DELAYED. Ask only this. Do not offer any compensation yet."
+    ],
+    "parse_rules": [
+      "Set task_state.comp_type: 'cancelled_flight' if they say the flight was cancelled by the airline; 'delayed_flight' if it was delayed.",
+      "Set task_state.comp_eligible using the compensation policy: eligible (true) ONLY if task_state.membership is 'silver' or 'gold', OR task_state.res_insurance == 'yes', OR task_state.res_cabin == 'business'. A regular member with no insurance flying (basic) economy is NOT eligible (false).",
+      "Set task_state.comp_amount: if comp_type == 'cancelled_flight', amount = 100 * task_state.res_passenger_count; if comp_type == 'delayed_flight', amount = 50 * task_state.res_passenger_count.",
+      "Set all three in the same response."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.comp_type"
+        },
+        {
+          "op": "set",
+          "path": "task_state.comp_eligible"
+        },
+        {
+          "op": "set",
+          "path": "task_state.comp_amount"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.comp_eligible != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.comp_type\",\"value\":\"cancelled_flight\"}, {\"op\":\"set\",\"path\":\"task_state.comp_eligible\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.comp_amount\",\"value\":200} ] }"
+  },
+  "OFFER_COMPENSATION": {
+    "goal_template": "offer the certificate amount and get confirmation before sending it",
+    "reads": [
+      "comp_amount"
+    ],
+    "base_actions": [
+      {
+        "tool": "offer_compensation",
+        "args": {},
+        "when": "task_state.comp_confirmed == null"
+      }
+    ],
+    "executor_sys_rules": [
+      "Tell the customer you can offer a travel certificate of $<task_state.comp_amount> as a gesture of goodwill, and ask them to confirm with a yes before you send it. Do not send anything yet."
+    ],
+    "parse_rules": [
+      "Set task_state.comp_confirmed=true if the customer agrees, says yes, says go ahead, or does NOT object to proceeding.",
+      "Set task_state.comp_confirmed=false ONLY if the customer explicitly declines or says not to do it."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.comp_confirmed"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.comp_confirmed != null"
+    ],
+    "sys_output_format": "{\"patch_ops\": [{\"op\": \"set\", \"path\": \"task_state.comp_confirmed\", \"value\": true}]}",
+    "confirm_template": "As a gesture of goodwill I can issue a ${comp_amount} travel certificate to your account. Would you like me to send it? (yes/no)"
+  },
+  "DO_COMPENSATION": {
+    "goal_template": "send the travel certificate",
+    "reads": [
+      "user_id",
+      "comp_amount"
+    ],
+    "base_actions": [
+      {
+        "tool": "send_certificate",
+        "args": {
+          "user_id": "<task_state.user_id>",
+          "amount": "<task_state.comp_amount>"
+        },
+        "when": "task_state.comp_confirmed == true and task_state.comp_done != true"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call send_certificate with user_id=<task_state.user_id> and amount=<task_state.comp_amount> exactly once. The amount and eligibility were already confirmed."
+    ],
+    "parse_rules": [
+      "From a send_certificate result containing 'Certificate ... added to user ...', set task_state.comp_done=true and task_state.resolved=true.",
+      "If it returned an error, set neither."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.comp_done"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.resolved == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.comp_done\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "ASK_BAGGAGE": {
+    "goal_template": "find out the new total bags / paid bags and which payment method",
+    "reads": [
+      "membership",
+      "res_cabin",
+      "res_passenger_count"
+    ],
+    "base_actions": [
+      {
+        "tool": "ask_baggage",
+        "args": {},
+        "when": "task_state.bag_nonfree == null"
+      }
+    ],
+    "executor_sys_rules": [
+      "Ask the customer how many checked bags they want in total and which saved payment method (a gift card or credit card on file) should cover any paid bags. Ask only this.",
+      "Reading one screen of detail back is fine, but ask for one thing at a time if they seem unsure."
+    ],
+    "parse_rules": [
+      "Set task_state.bag_total to the new TOTAL number of checked bags the customer wants.",
+      "Free checked-bag allowance PER PASSENGER depends on membership and cabin: regular = 0 (basic_economy) / 1 (economy) / 2 (business); silver = 1 / 2 / 3; gold = 2 / 3 / 4. Free allowance for the whole reservation = (per-passenger allowance) * task_state.res_passenger_count.",
+      "Set task_state.bag_nonfree = max(0, bag_total - free allowance for the reservation). Each non-free bag costs $50.",
+      "If the customer names a saved payment method id (e.g. 'gift_card_123' or 'credit_card_456'), set task_state.res_payment_id to it."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.bag_total"
+        },
+        {
+          "op": "set",
+          "path": "task_state.bag_nonfree"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_payment_id"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.bag_nonfree != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.bag_total\",\"value\":3}, {\"op\":\"set\",\"path\":\"task_state.bag_nonfree\",\"value\":1}, {\"op\":\"set\",\"path\":\"task_state.res_payment_id\",\"value\":\"credit_card_456\"} ] }"
+  },
+  "CONFIRM_BAGGAGE": {
+    "goal_template": "confirm the baggage change and the fee before applying it",
+    "reads": [
+      "bag_total",
+      "bag_nonfree",
+      "res_payment_id"
+    ],
+    "base_actions": [
+      {
+        "tool": "confirm_baggage",
+        "args": {},
+        "when": "task_state.bag_confirmed == null"
+      }
+    ],
+    "executor_sys_rules": [
+      "Tell the customer the new total checked bags (<task_state.bag_total>), how many are paid (<task_state.bag_nonfree>) at $50 each, the total fee, and the payment method, then ask them to confirm with a yes. Do not apply anything yet."
+    ],
+    "parse_rules": [
+      "Set task_state.bag_confirmed=true if the customer agrees, says yes, says go ahead, or does NOT object to proceeding.",
+      "Set task_state.bag_confirmed=false ONLY if the customer explicitly declines or says not to do it."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.bag_confirmed"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.bag_confirmed != null"
+    ],
+    "sys_output_format": "{\"patch_ops\": [{\"op\": \"set\", \"path\": \"task_state.bag_confirmed\", \"value\": true}]}",
+    "confirm_template": "I'd like to confirm: set reservation {reservation_id} to {bag_total} checked bags ({bag_nonfree} paid at $50 each), charged to {res_payment_id}. Shall I proceed? (yes/no)"
+  },
+  "DO_BAGGAGE": {
+    "goal_template": "apply the baggage update",
+    "reads": [
+      "reservation_id",
+      "bag_total",
+      "bag_nonfree",
+      "res_payment_id"
+    ],
+    "base_actions": [
+      {
+        "tool": "update_reservation_baggages",
+        "args": {
+          "reservation_id": "<task_state.reservation_id>",
+          "total_baggages": "<task_state.bag_total>",
+          "nonfree_baggages": "<task_state.bag_nonfree>",
+          "payment_id": "<task_state.res_payment_id>"
+        },
+        "when": "task_state.bag_confirmed == true and task_state.bag_done != true"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call update_reservation_baggages once with reservation_id=<task_state.reservation_id>, total_baggages=<task_state.bag_total>, nonfree_baggages=<task_state.bag_nonfree>, payment_id=<task_state.res_payment_id>."
+    ],
+    "parse_rules": [
+      "From the update_reservation_baggages result (the updated reservation object), set task_state.bag_done=true and task_state.resolved=true.",
+      "If it returned an error, set neither."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.bag_done"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.resolved == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.bag_done\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "ASK_CABIN_CHANGE": {
+    "goal_template": "find out the target cabin and the payment method for a cabin change (flights unchanged)",
+    "reads": [
+      "res_cabin",
+      "res_flights"
+    ],
+    "base_actions": [
+      {
+        "tool": "ask_cabin_change",
+        "args": {},
+        "when": "task_state.new_cabin == null"
+      }
+    ],
+    "executor_sys_rules": [
+      "Ask the customer which cabin they want to change to (basic_economy / economy / business) and which saved payment method (a gift card or credit card on file) should cover any fare difference or receive the refund. Ask only this."
+    ],
+    "parse_rules": [
+      "Set task_state.new_cabin from the reply (basic_economy / economy / business).",
+      "Set task_state.new_flights = a copy of task_state.res_flights VERBATIM (a cabin change keeps the same flights), as the JSON array of {flight_number,date}.",
+      "If the customer names a saved payment method id (gift_card_* / credit_card_*), set task_state.res_payment_id to it.",
+      "Set task_state.res_payment_id ONLY to an id that appears in task_state.user_payment_ids (map 'my visa'/'gift card' to the matching id). Do not invent an id."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.new_cabin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.new_flights"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_payment_id"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.new_cabin != null",
+      "task_state.new_flights != null",
+      "task_state.res_payment_id != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.new_cabin\",\"value\":\"economy\"}, {\"op\":\"set\",\"path\":\"task_state.new_flights\",\"value\":[{\"flight_number\":\"HAT028\",\"date\":\"2024-05-21\"},{\"flight_number\":\"HAT277\",\"date\":\"2024-05-21\"}]}, {\"op\":\"set\",\"path\":\"task_state.res_payment_id\",\"value\":\"credit_card_2929732\"} ] }"
+  },
+  "ASK_FLIGHT_CHANGE": {
+    "goal_template": "find out what the customer wants to change: the new date/preference (to search) or a specific flight they already know",
+    "reads": [
+      "res_cabin",
+      "res_flights",
+      "res_trip_type",
+      "res_origin",
+      "res_dest"
+    ],
+    "base_actions": [
+      {
+        "tool": "ask_flight_change",
+        "args": {},
+        "when": "task_state.new_flights == null and task_state.new_date == null"
+      }
+    ],
+    "executor_sys_rules": [
+      "Ask the customer what they want to change about the flight: the new date, and any preference (e.g. a nonstop, or the cheapest). The origin, destination, and trip type cannot change. Also ask which saved payment method (gift card / credit card on file) should cover any fare difference. Keep it to one short message."
+    ],
+    "parse_rules": [
+      "If the customer already names a specific flight number (and date), set task_state.new_flights = the full segment array for the reservation after the change (keep unchanged segments from task_state.res_flights, swap in the named flight_number+date), and set task_state.new_cabin = task_state.res_cabin.",
+      "Otherwise set task_state.new_date = the YYYY-MM-DD date they want the changed flight on (use 2024 and the month/day they give), and set task_state.new_cabin = task_state.res_cabin. Do not invent a flight number.",
+      "If the customer names a saved payment method id (gift_card_* / credit_card_*), set task_state.res_payment_id to it.",
+      "Set task_state.res_payment_id ONLY to an id that appears in task_state.user_payment_ids (map 'my visa'/'gift card' to the matching id). Do not invent an id."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.new_flights"
+        },
+        {
+          "op": "set",
+          "path": "task_state.new_date"
+        },
+        {
+          "op": "set",
+          "path": "task_state.new_cabin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_payment_id"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.new_date != null or task_state.new_flights != null",
+      "task_state.res_payment_id != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.new_date\",\"value\":\"2024-05-21\"}, {\"op\":\"set\",\"path\":\"task_state.new_cabin\",\"value\":\"economy\"}, {\"op\":\"set\",\"path\":\"task_state.res_payment_id\",\"value\":\"credit_card_9659780\"} ] }"
+  },
+  "SEARCH_FLIGHTS": {
+    "goal_template": "search for the new flight on the requested date and assemble the full new_flights array",
+    "reads": [
+      "res_origin",
+      "res_dest",
+      "new_date",
+      "res_flights",
+      "res_trip_type"
+    ],
+    "base_actions": [
+      {
+        "tool": "search_direct_flight",
+        "args": {
+          "origin": "<task_state.res_origin>",
+          "destination": "<task_state.res_dest>",
+          "date": "<task_state.new_date>"
+        },
+        "when": "task_state.new_flights == null and a direct option has not been searched yet"
+      },
+      {
+        "tool": "search_onestop_flight",
+        "args": {
+          "origin": "<task_state.res_origin>",
+          "destination": "<task_state.res_dest>",
+          "date": "<task_state.new_date>"
+        },
+        "when": "no direct flight is available and a one-stop is needed"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call search_direct_flight with origin=<task_state.res_origin>, destination=<task_state.res_dest>, date=<task_state.new_date>. If it returns no usable option, call search_onestop_flight with the same arguments.",
+      "Do not ask the customer here; you are searching."
+    ],
+    "parse_rules": [
+      "From the search result (a JSON list of available flights, each with flight_number, prices by cabin, and scheduled times), choose the flight that best matches the customer's stated preference (cheapest in task_state.res_cabin, or a nonstop, etc.).",
+      "Set task_state.new_flights = the FULL new segment array for the reservation: keep any unchanged segments from task_state.res_flights and use the chosen flight_number with task_state.new_date for the changed leg. For a simple one-way change this is a single-element array [{flight_number, date}].",
+      "Set task_state.search_done = true once new_flights is set. If the search returned nothing usable, set search_done=true but leave new_flights null (the flow will then transfer)."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.new_flights"
+        },
+        {
+          "op": "set",
+          "path": "task_state.search_done"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.search_done == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.new_flights\",\"value\":[{\"flight_number\":\"HAT041\",\"date\":\"2024-05-21\"}]}, {\"op\":\"set\",\"path\":\"task_state.search_done\",\"value\":true} ] }"
+  },
+  "CONFIRM_MODIFY": {
+    "goal_template": "confirm the flight/cabin change and any fare difference before applying it",
+    "reads": [
+      "new_cabin",
+      "new_flights",
+      "res_payment_id"
+    ],
+    "base_actions": [
+      {
+        "tool": "confirm_modify",
+        "args": {},
+        "when": "task_state.modify_confirmed == null"
+      }
+    ],
+    "executor_sys_rules": [
+      "State the change you are about to make — the new cabin (<task_state.new_cabin>) and/or the new flight(s) (<task_state.new_flights>), and that any fare difference will be charged to / refunded from <task_state.res_payment_id> — then ask the customer to confirm with a yes. Do not apply anything yet."
+    ],
+    "parse_rules": [
+      "Set task_state.modify_confirmed=true if the customer agrees, says yes, says go ahead, or does NOT object to proceeding.",
+      "Set task_state.modify_confirmed=false ONLY if the customer explicitly declines or says not to do it."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.modify_confirmed"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.modify_confirmed != null"
+    ],
+    "sys_output_format": "{\"patch_ops\": [{\"op\": \"set\", \"path\": \"task_state.modify_confirmed\", \"value\": true}]}",
+    "confirm_template": "I'd like to confirm: change reservation {reservation_id} to flights {new_flights} in {new_cabin} cabin. Any fare difference will be applied to {res_payment_id}. Shall I go ahead? (yes/no)"
+  },
+  "DO_MODIFY_FLIGHTS": {
+    "goal_template": "apply the flight/cabin change",
+    "reads": [
+      "reservation_id",
+      "new_cabin",
+      "new_flights",
+      "res_payment_id"
+    ],
+    "base_actions": [
+      {
+        "tool": "update_reservation_flights",
+        "args": {
+          "reservation_id": "<task_state.reservation_id>",
+          "cabin": "<task_state.new_cabin>",
+          "flights": "<task_state.new_flights>",
+          "payment_id": "<task_state.res_payment_id>"
+        },
+        "when": "task_state.modify_confirmed == true and task_state.modify_done != true"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call update_reservation_flights once with reservation_id=<task_state.reservation_id>, cabin=<task_state.new_cabin>, payment_id=<task_state.res_payment_id>, and flights = EXACTLY the JSON array in task_state.new_flights (include every segment, even unchanged ones). Do not alter the array."
+    ],
+    "parse_rules": [
+      "From the update_reservation_flights result (the updated reservation object), set task_state.modify_done=true and task_state.resolved=true.",
+      "If it returned an error, set neither."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.modify_done"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.resolved == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.modify_done\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "TRANSFER_HUMAN": {
+    "goal_template": "transfer to a human agent when the request is outside the agent's scope or not permitted",
+    "reads": [
+      "intent",
+      "reservation_id"
+    ],
+    "base_actions": [
+      {
+        "tool": "transfer_to_human_agents",
+        "args": {
+          "summary": "<one-line summary of the customer's request and why it needs a human>"
+        },
+        "when": "task_state.escalated != true"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call transfer_to_human_agents once with a concise summary. Transfer when the request cannot be completed here: a flight has already been flown, or the request is a booking / flight change / cabin change / passenger change that must be handled by a human in this configuration."
+    ],
+    "parse_rules": [
+      "After 'Transfer successful', set task_state.escalated=true."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.escalated"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.escalated == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.escalated\",\"value\":true} ] }"
+  }
+}

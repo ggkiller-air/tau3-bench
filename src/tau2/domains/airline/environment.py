@@ -18,18 +18,23 @@ def get_environment(
     db: Optional[FlightDB] = None,
     solo_mode: bool = False,
 ) -> Environment:
-    if solo_mode:
-        raise ValueError("Airline domain does not support solo mode")
     if db is None:
         db = FlightDB.load(AIRLINE_DB_PATH)
     tools = AirlineTools(db)
     with open(AIRLINE_POLICY_PATH, "r") as fp:
         policy = fp.read()
-    return Environment(
+    env = Environment(
         domain_name="airline",
         policy=policy,
         tools=tools,
     )
+    # Airline has no separate user tools (same as retail), so solo mode (agent
+    # operates all tools, no user simulator) is trivially valid — enable it for
+    # the schema_solo_std_agent generalization experiment. Non-solo (interactive)
+    # behavior is unchanged.
+    if solo_mode:
+        env.set_solo_mode(True)
+    return env
 
 
 def get_tasks(task_split_name: Optional[str] = "base") -> list[Task]:

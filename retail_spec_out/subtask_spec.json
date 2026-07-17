@@ -1,0 +1,374 @@
+{
+  "__about__": "Retail primitives, v3 multi-transaction. AUTH/GET_USER/LOAD_ORDER are reads; PLAN_TXNS builds the transaction queue; POP_TARGET loads one transaction into the working registers; PLAN_CHANGES/WALK_VARIANT/RESOLVE_RETURN_ITEMS prepare item args; DO_* execute one transaction and ADVANCE (clear requested_action+order_status -> next POP) or set resolved when the queue is empty. POP_TARGET/SKIP_TARGET/FINALIZE carry their state mutation on a no-op calculate() call (the executor must emit a tool call; calculate is harmless and always available). Tools return JSON objects or an error string; parse_rules read JSON fields. HILO (gpt-5.4) re-extracts the load-bearing parses (PLAN_TXNS/POP_TARGET/PLAN_CHANGES/WALK_VARIANT/RESOLVE_RETURN_ITEMS/LOAD_ORDER).",
+
+  "AUTH": {
+    "goal_template": "authenticate the customer (email, then name+zip)",
+    "reads": ["customer_email", "customer_first", "customer_last", "customer_zip"],
+    "base_actions": [
+      { "tool": "find_user_id_by_email", "args": { "email": "<task_state.customer_email>" }, "when": "email set and not yet tried" },
+      { "tool": "find_user_id_by_name_zip", "args": { "first_name": "<task_state.customer_first>", "last_name": "<task_state.customer_last>", "zip": "<task_state.customer_zip>" }, "when": "no email, or email already tried" }
+    ],
+    "executor_sys_rules": [
+      "If task_state.customer_email is set and task_state.tried_email is not true, call find_user_id_by_email(email=task_state.customer_email).",
+      "Otherwise call find_user_id_by_name_zip(first_name=task_state.customer_first, last_name=task_state.customer_last, zip=task_state.customer_zip). One tool per step, read-only."
+    ],
+    "parse_rules": [
+      "The result is the user id string (e.g. 'yusuf_rossi_9620'). Set task_state.user_id to that exact string.",
+      "If the tool was find_user_id_by_email set task_state.tried_email=true; if it was find_user_id_by_name_zip set task_state.tried_name=true.",
+      "On 'User not found' do not set user_id."
+    ],
+    "patch_ops_policy": { "allowed": [
+      { "op": "set", "path": "task_state.user_id" },
+      { "op": "set", "path": "task_state.tried_email" },
+      { "op": "set", "path": "task_state.tried_name" }
+    ] },
+    "done_when_all": [ "task_state.user_id != null" ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.user_id\",\"value\":\"yusuf_rossi_9620\"}, {\"op\":\"set\",\"path\":\"task_state.tried_name\",\"value\":true} ] }"
+  },
+
+  "GET_USER": {
+    "goal_template": "load the customer profile (orders + payment methods)",
+    "reads": ["user_id"],
+    "base_actions": [
+      { "tool": "get_user_details", "args": { "user_id": "<task_state.user_id>" }, "when": "task_state.user_loaded == null" }
+    ],
+    "executor_sys_rules": [ "Call get_user_details(user_id=task_state.user_id). Read-only." ],
+    "parse_rules": [
+      "The result is the user JSON. Set task_state.user_loaded = true.",
+      "Set task_state.candidate_order_ids to a JSON array of the customer's order ids (the 'orders' field)."
+    ],
+    "patch_ops_policy": { "allowed": [
+      { "op": "set", "path": "task_state.user_loaded" },
+      { "op": "set", "path": "task_state.candidate_order_ids" }
+    ] },
+    "done_when_all": [ "task_state.user_loaded != null" ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.user_loaded\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.candidate_order_ids\",\"value\":[\"#W1\",\"#W2\"]} ] }"
+  },
+
+  "PLAN_TXNS": {
+    "goal_template": "parse the full request into an ordered queue of transactions",
+    "reads": ["goal", "candidate_order_ids"],
+    "base_actions": [
+      { "tool": "get_user_details", "args": { "user_id": "<task_state.user_id>" }, "when": "task_state.txn_queue == null" }
+    ],
+    "executor_sys_rules": [ "Call get_user_details(user_id=task_state.user_id) to see the customer's orders and statuses, so you can plan. Read-only." ],
+    "parse_rules": [
+      "The result is the user JSON (has 'orders'). Read the customer's full request from the goal and build task_state.txn_queue: a JSON array with ONE entry per distinct transaction the customer wants, each = {\"action\": one of 'cancel'/'modify_address'/'modify_payment'/'modify_user_address'/'modify_items'/'exchange'/'return', \"order_id\": the target order id (or null if it applies to no specific order), \"details\": the FULL relevant detail VERBATIM from the goal (which items + their new options, the new address, the reason) — do NOT over-summarize; later steps rely on it}.",
+      "Action mapping: wants the order undone / can't pay / placed by mistake -> 'cancel'. Wants a different card/giftcard for an order -> 'modify_payment'. Wants a different shipping address for an order -> 'modify_address'. Wants different item options on a PENDING order -> 'modify_items'. Wants different item options on a DELIVERED order -> 'exchange'. Wants money back for delivered items -> 'return'.",
+      "If the customer says 'cancel ALL pending orders' or 'return/cancel everything', emit one 'cancel' (or 'return') entry per order id in the customer's orders — non-applicable ones will be skipped automatically.",
+      "If a request is conditional ('change X, but if unavailable cancel'), emit the PRIMARY action ('modify_items' or 'exchange'); the walk will fall back to cancel if no variant is available.",
+      "Use REAL order ids from the orders list. Emit at least one entry."
+    ],
+    "patch_ops_policy": { "allowed": [ { "op": "set", "path": "task_state.txn_queue" } ] },
+    "done_when_all": [ "task_state.txn_queue != null" ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.txn_queue\",\"value\":[{\"action\":\"cancel\",\"order_id\":\"#W1\",\"details\":\"no longer needed\"}]} ] }"
+  },
+
+  "POP_TARGET": {
+    "goal_template": "load the next transaction from the queue into the working registers",
+    "reads": ["txn_queue"],
+    "base_actions": [
+      { "tool": "calculate", "args": { "expression": "1" }, "when": "always (no-op carrier; the real work is in parse_rules)" }
+    ],
+    "executor_sys_rules": [ "Call calculate with expression '1'. This is a no-op; it just lets the loop advance." ],
+    "parse_rules": [
+      "Ignore the calculate result. Take the FIRST entry of task_state.txn_queue.",
+      "Set task_state.requested_action = that entry's action. Set task_state.order_id = that entry's order_id (or null). Set task_state.txn_details = that entry's details.",
+      "If the action is 'cancel', set task_state.cancel_reason from the details ('ordered by mistake' if the details say a mistake, else 'no longer needed').",
+      "If the action is 'modify_address' or 'modify_user_address', set new_address1/new_address2/new_city/new_state/new_zip/new_country from the details IF the details give a full address; otherwise leave them null (a later step will merge with the existing address).",
+      "CONSUME the head: set task_state.txn_queue to the SAME array with its first entry removed, or null if it was the last entry.",
+      "CLEAR the per-order working registers: set task_state.order_status=null, task_state.order_items=null, task_state.item_ids=null, task_state.new_item_ids=null, task_state.change_plan=null."
+    ],
+    "patch_ops_policy": { "allowed": [
+      { "op": "set", "path": "task_state.requested_action" },
+      { "op": "set", "path": "task_state.order_id" },
+      { "op": "set", "path": "task_state.txn_details" },
+      { "op": "set", "path": "task_state.cancel_reason" },
+      { "op": "set", "path": "task_state.new_address1" }, { "op": "set", "path": "task_state.new_address2" }, { "op": "set", "path": "task_state.new_city" }, { "op": "set", "path": "task_state.new_state" }, { "op": "set", "path": "task_state.new_country" }, { "op": "set", "path": "task_state.new_zip" },
+      { "op": "set", "path": "task_state.txn_queue" },
+      { "op": "set", "path": "task_state.order_status" },
+      { "op": "set", "path": "task_state.order_items" },
+      { "op": "set", "path": "task_state.item_ids" },
+      { "op": "set", "path": "task_state.new_item_ids" },
+      { "op": "set", "path": "task_state.change_plan" }
+    ] },
+    "done_when_all": [ "task_state.requested_action != null" ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.requested_action\",\"value\":\"cancel\"}, {\"op\":\"set\",\"path\":\"task_state.order_id\",\"value\":\"#W1\"}, {\"op\":\"set\",\"path\":\"task_state.cancel_reason\",\"value\":\"no longer needed\"}, {\"op\":\"set\",\"path\":\"task_state.txn_queue\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.order_status\",\"value\":null} ] }"
+  },
+
+  "SKIP_TARGET": {
+    "goal_template": "skip a transaction whose precondition is not met (e.g. cancel a non-pending order), advance to the next",
+    "reads": ["requested_action", "order_status", "txn_queue"],
+    "base_actions": [
+      { "tool": "calculate", "args": { "expression": "1" }, "when": "always (no-op carrier)" }
+    ],
+    "executor_sys_rules": [ "Call calculate with expression '1'. No-op; the loop advances in parse_rules." ],
+    "parse_rules": [
+      "Ignore the result. This transaction cannot be performed (its order is not in the required status). ADVANCE: set task_state.requested_action=null, task_state.order_status=null, task_state.order_id=null.",
+      "If task_state.txn_queue is null (this was the last transaction), also set task_state.resolved=true."
+    ],
+    "patch_ops_policy": { "allowed": [
+      { "op": "set", "path": "task_state.requested_action" },
+      { "op": "set", "path": "task_state.order_status" },
+      { "op": "set", "path": "task_state.order_id" },
+      { "op": "set", "path": "task_state.resolved" }
+    ] },
+    "done_when_all": [ "task_state.requested_action == null" ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.requested_action\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.order_status\",\"value\":null} ] }"
+  },
+
+  "LOAD_ORDER": {
+    "goal_template": "read the current transaction's order: status, items, original payment",
+    "reads": ["order_id"],
+    "base_actions": [
+      { "tool": "get_order_details", "args": { "order_id": "<task_state.order_id, or — if null — the order id from the customer's orders matching txn_details>" }, "when": "task_state.order_status == null" }
+    ],
+    "executor_sys_rules": [
+      "Call get_order_details (read-only, keep the leading '#'). If task_state.order_id is set, read it; otherwise pick the order from the customer's orders that matches task_state.txn_details and read it."
+    ],
+    "parse_rules": [
+      "The result is the order JSON. Set task_state.order_id to its 'order_id'. Set task_state.order_status to its 'status' verbatim.",
+      "Set task_state.order_items to a JSON array of its items as {\"item_id\":..,\"product_id\":..,\"name\":..,\"options\":..}.",
+      "Set task_state.payment_method_id to payment_history[0].payment_method_id (the order's original payment)."
+    ],
+    "patch_ops_policy": { "allowed": [
+      { "op": "set", "path": "task_state.order_id" },
+      { "op": "set", "path": "task_state.order_status" },
+      { "op": "set", "path": "task_state.order_items" },
+      { "op": "set", "path": "task_state.payment_method_id" }
+    ] },
+    "done_when_all": [ "task_state.order_status != null" ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.order_status\",\"value\":\"pending\"}, {\"op\":\"set\",\"path\":\"task_state.payment_method_id\",\"value\":\"credit_card_9513926\"} ] }"
+  },
+
+  "PLAN_CHANGES": {
+    "goal_template": "plan which order items to change and to what new options for the current transaction",
+    "reads": ["order_id", "order_items", "txn_details"],
+    "base_actions": [
+      { "tool": "get_order_details", "args": { "order_id": "<task_state.order_id>" }, "when": "task_state.change_plan == null" }
+    ],
+    "executor_sys_rules": [ "Re-read get_order_details(order_id=task_state.order_id) to see the items. Read-only." ],
+    "parse_rules": [
+      "The result is the order JSON with an 'items' list. Match the request (task_state.txn_details AND the overall task_state.goal) against the items.",
+      "Set task_state.change_plan to a JSON array with ONE entry per item to change: {\"old_item_id\": <REAL item_id>, \"product_id\": <REAL product_id>, \"desired_options\": <short text of the new options for THIS item>}.",
+      "Include EVERY item the customer wants changed in this transaction — if they mention two items (e.g. a keyboard AND a thermostat), the array MUST have two entries. Use REAL ids."
+    ],
+    "patch_ops_policy": { "allowed": [ { "op": "set", "path": "task_state.change_plan" } ] },
+    "done_when_all": [ "task_state.change_plan != null" ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.change_plan\",\"value\":[{\"old_item_id\":\"<id>\",\"product_id\":\"<pid>\",\"desired_options\":\"<opts>\"}]} ] }"
+  },
+
+  "WALK_VARIANT": {
+    "goal_template": "resolve one planned change into (old_item_id -> available new variant), consuming change_plan; fall back to cancel if no variant is available",
+    "reads": ["change_plan", "item_ids", "new_item_ids", "txn_queue"],
+    "base_actions": [
+      { "tool": "get_product_details", "args": { "product_id": "<the product_id of the FIRST entry in task_state.change_plan>" }, "when": "task_state.change_plan != null" }
+    ],
+    "executor_sys_rules": [ "Call get_product_details with the FIRST change_plan entry's product_id. Read-only. One entry per step." ],
+    "parse_rules": [
+      "The result is the product JSON; 'variants' maps REAL item_id -> {options, available, price}.",
+      "Take the FIRST entry of task_state.change_plan. Among AVAILABLE variants, pick the item_id whose options match that entry's desired_options (use a REAL variant id).",
+      "If a matching AVAILABLE variant exists: APPEND that entry's old_item_id to task_state.item_ids (current list or [] plus it), and APPEND the chosen new variant id to task_state.new_item_ids. Then CONSUME the head: if change_plan had MORE THAN ONE entry, set task_state.change_plan to the SAME array WITHOUT its first entry (keep the rest!); ONLY set it to null when the entry you just processed was the LAST one.",
+      "If NO available variant matches (the conditional fallback): the customer said to cancel in that case — set task_state.requested_action='cancel', task_state.cancel_reason='no longer needed', and task_state.change_plan=null (the order is pending so DO_CANCEL will run)."
+    ],
+    "patch_ops_policy": { "allowed": [
+      { "op": "set", "path": "task_state.item_ids" },
+      { "op": "set", "path": "task_state.new_item_ids" },
+      { "op": "set", "path": "task_state.change_plan" },
+      { "op": "set", "path": "task_state.requested_action" },
+      { "op": "set", "path": "task_state.cancel_reason" }
+    ] },
+    "done_when_all": [ "task_state.change_plan == null" ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.item_ids\",\"value\":[\"<old_id>\"]}, {\"op\":\"set\",\"path\":\"task_state.new_item_ids\",\"value\":[\"<new_id>\"]}, {\"op\":\"set\",\"path\":\"task_state.change_plan\",\"value\":null} ] }"
+  },
+
+  "RESOLVE_RETURN_ITEMS": {
+    "goal_template": "determine which order item_ids to return for the current transaction",
+    "reads": ["order_id", "order_items", "txn_details"],
+    "base_actions": [
+      { "tool": "get_order_details", "args": { "order_id": "<task_state.order_id>" }, "when": "task_state.item_ids == null" }
+    ],
+    "executor_sys_rules": [ "Re-read get_order_details(order_id=task_state.order_id) to see the items. Read-only." ],
+    "parse_rules": [
+      "The result is the order JSON with an 'items' list. Set task_state.item_ids to a JSON array of the item_id(s) to RETURN — match task_state.txn_details against the items by name/options.",
+      "Include EVERY item the customer wants returned in this transaction (often several). If they say 'everything' / 'all', include every item_id. Use REAL item_ids."
+    ],
+    "patch_ops_policy": { "allowed": [ { "op": "set", "path": "task_state.item_ids" } ] },
+    "done_when_all": [ "task_state.item_ids != null" ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.item_ids\",\"value\":[\"<item_id_from_order>\"]} ] }"
+  },
+
+  "DO_CANCEL": {
+    "goal_template": "cancel the current pending order, then advance",
+    "reads": ["order_id", "cancel_reason", "txn_queue"],
+    "base_actions": [
+      { "tool": "cancel_pending_order", "args": { "order_id": "<task_state.order_id>", "reason": "<task_state.cancel_reason>" }, "when": "task_state.resolved == false" }
+    ],
+    "executor_sys_rules": [ "Call cancel_pending_order(order_id=task_state.order_id, reason=task_state.cancel_reason) — reason must be 'no longer needed' or 'ordered by mistake'. Once." ],
+    "parse_rules": [
+      "The result is the updated order JSON. If its 'status' is now 'cancelled', the transaction succeeded.",
+      "On success: if task_state.txn_queue is null (last transaction) set task_state.resolved=true; otherwise ADVANCE — set task_state.requested_action=null and task_state.order_status=null.",
+      "On error, set nothing."
+    ],
+    "patch_ops_policy": { "allowed": [
+      { "op": "set", "path": "task_state.resolved" },
+      { "op": "set", "path": "task_state.requested_action" },
+      { "op": "set", "path": "task_state.order_status" }
+    ] },
+    "done_when_all": [ "task_state.resolved == true or task_state.requested_action == null" ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.requested_action\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.order_status\",\"value\":null} ] }"
+  },
+
+  "DO_MODIFY_ADDRESS": {
+    "goal_template": "modify the current pending order's shipping address, then advance",
+    "reads": ["order_id", "order_items", "txn_details", "new_address1", "txn_queue"],
+    "base_actions": [
+      { "tool": "modify_pending_order_address", "args": { "order_id": "<task_state.order_id>", "address1": "<full new address1>", "address2": "<address2 or ''>", "city": "<city>", "state": "<state>", "country": "<country>", "zip": "<zip>" }, "when": "task_state.resolved == false" }
+    ],
+    "executor_sys_rules": [
+      "Call modify_pending_order_address. Build the FULL address: start from the order's CURRENT address (you saw it in the order details) and apply ONLY the change the customer asked for in task_state.txn_details (e.g. if they only change the unit, keep address1/city/state/zip and set address2). If task_state.new_address1 etc are set, use them. Once."
+    ],
+    "parse_rules": [
+      "The result is the updated order JSON. If it is a valid order (not an error), the transaction succeeded.",
+      "On success: if task_state.txn_queue is null set task_state.resolved=true; otherwise set task_state.requested_action=null and task_state.order_status=null."
+    ],
+    "patch_ops_policy": { "allowed": [
+      { "op": "set", "path": "task_state.resolved" },
+      { "op": "set", "path": "task_state.requested_action" },
+      { "op": "set", "path": "task_state.order_status" }
+    ] },
+    "done_when_all": [ "task_state.resolved == true or task_state.requested_action == null" ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.requested_action\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.order_status\",\"value\":null} ] }"
+  },
+
+  "DO_MODIFY_PAYMENT": {
+    "goal_template": "modify the current pending order's payment method, then advance",
+    "reads": ["order_id", "txn_details", "txn_queue"],
+    "base_actions": [
+      { "tool": "modify_pending_order_payment", "args": { "order_id": "<task_state.order_id>", "payment_method_id": "<the NEW payment method id from txn_details, different from the original>" }, "when": "task_state.resolved == false" }
+    ],
+    "executor_sys_rules": [ "Call modify_pending_order_payment(order_id, payment_method_id=the NEW method the customer wants, different from the order's current one). Once." ],
+    "parse_rules": [
+      "The result is the updated order JSON. If it is a valid order (not an error), the transaction succeeded.",
+      "On success: if task_state.txn_queue is null set task_state.resolved=true; otherwise set task_state.requested_action=null and task_state.order_status=null."
+    ],
+    "patch_ops_policy": { "allowed": [
+      { "op": "set", "path": "task_state.resolved" },
+      { "op": "set", "path": "task_state.requested_action" },
+      { "op": "set", "path": "task_state.order_status" }
+    ] },
+    "done_when_all": [ "task_state.resolved == true or task_state.requested_action == null" ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.requested_action\",\"value\":null} ] }"
+  },
+
+  "DO_MODIFY_USER_ADDRESS": {
+    "goal_template": "modify the customer's default account address, then advance",
+    "reads": ["user_id", "txn_details", "new_address1", "txn_queue"],
+    "base_actions": [
+      { "tool": "modify_user_address", "args": { "user_id": "<task_state.user_id>", "address1": "<new address1>", "address2": "<address2 or ''>", "city": "<city>", "state": "<state>", "country": "<country>", "zip": "<zip>" }, "when": "task_state.resolved == false" }
+    ],
+    "executor_sys_rules": [ "Call modify_user_address(user_id, full new address fields from task_state.txn_details / new_address*). Once." ],
+    "parse_rules": [
+      "The result is the updated user JSON. If valid (not an error), success.",
+      "On success: if task_state.txn_queue is null set task_state.resolved=true; otherwise set task_state.requested_action=null and task_state.order_status=null."
+    ],
+    "patch_ops_policy": { "allowed": [
+      { "op": "set", "path": "task_state.resolved" },
+      { "op": "set", "path": "task_state.requested_action" },
+      { "op": "set", "path": "task_state.order_status" }
+    ] },
+    "done_when_all": [ "task_state.resolved == true or task_state.requested_action == null" ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.requested_action\",\"value\":null} ] }"
+  },
+
+  "DO_RETURN": {
+    "goal_template": "request a return of the current delivered items, then advance",
+    "reads": ["order_id", "item_ids", "payment_method_id", "txn_queue"],
+    "base_actions": [
+      { "tool": "return_delivered_order_items", "args": { "order_id": "<task_state.order_id>", "item_ids": "<task_state.item_ids>", "payment_method_id": "<task_state.payment_method_id>" }, "when": "task_state.resolved == false" }
+    ],
+    "executor_sys_rules": [ "Call return_delivered_order_items(order_id, item_ids=task_state.item_ids, payment_method_id=task_state.payment_method_id — original payment or an existing gift card). Once." ],
+    "parse_rules": [
+      "The result is the updated order JSON. If its 'status' is now 'return requested', success.",
+      "On success: if task_state.txn_queue is null set task_state.resolved=true; otherwise set task_state.requested_action=null and task_state.order_status=null and task_state.item_ids=null."
+    ],
+    "patch_ops_policy": { "allowed": [
+      { "op": "set", "path": "task_state.resolved" },
+      { "op": "set", "path": "task_state.requested_action" },
+      { "op": "set", "path": "task_state.order_status" },
+      { "op": "set", "path": "task_state.item_ids" }
+    ] },
+    "done_when_all": [ "task_state.resolved == true or task_state.requested_action == null" ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.requested_action\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.item_ids\",\"value\":null} ] }"
+  },
+
+  "DO_EXCHANGE": {
+    "goal_template": "exchange the current delivered items, then advance",
+    "reads": ["order_id", "item_ids", "new_item_ids", "payment_method_id", "txn_queue"],
+    "base_actions": [
+      { "tool": "exchange_delivered_order_items", "args": { "order_id": "<task_state.order_id>", "item_ids": "<task_state.item_ids>", "new_item_ids": "<task_state.new_item_ids>", "payment_method_id": "<task_state.payment_method_id>" }, "when": "task_state.resolved == false" }
+    ],
+    "executor_sys_rules": [ "Call exchange_delivered_order_items(order_id, item_ids=task_state.item_ids, new_item_ids=task_state.new_item_ids, payment_method_id=task_state.payment_method_id). Once." ],
+    "parse_rules": [
+      "The result is the updated order JSON. If its 'status' is now 'exchange requested', success.",
+      "On success: if task_state.txn_queue is null set task_state.resolved=true; otherwise set task_state.requested_action=null and task_state.order_status=null and task_state.item_ids=null and task_state.new_item_ids=null."
+    ],
+    "patch_ops_policy": { "allowed": [
+      { "op": "set", "path": "task_state.resolved" },
+      { "op": "set", "path": "task_state.requested_action" },
+      { "op": "set", "path": "task_state.order_status" },
+      { "op": "set", "path": "task_state.item_ids" },
+      { "op": "set", "path": "task_state.new_item_ids" }
+    ] },
+    "done_when_all": [ "task_state.resolved == true or task_state.requested_action == null" ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.requested_action\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.new_item_ids\",\"value\":null} ] }"
+  },
+
+  "DO_MODIFY_ITEMS": {
+    "goal_template": "modify the current pending order's items, then advance",
+    "reads": ["order_id", "item_ids", "new_item_ids", "payment_method_id", "txn_queue"],
+    "base_actions": [
+      { "tool": "modify_pending_order_items", "args": { "order_id": "<task_state.order_id>", "item_ids": "<task_state.item_ids>", "new_item_ids": "<task_state.new_item_ids>", "payment_method_id": "<task_state.payment_method_id>" }, "when": "task_state.resolved == false" }
+    ],
+    "executor_sys_rules": [ "Call modify_pending_order_items(order_id, item_ids=task_state.item_ids, new_item_ids=task_state.new_item_ids, payment_method_id=task_state.payment_method_id). Can be called only ONCE — include all items. Once." ],
+    "parse_rules": [
+      "The result is the updated order JSON. If its 'status' is now 'pending (item modified)', success.",
+      "On success: if task_state.txn_queue is null set task_state.resolved=true; otherwise set task_state.requested_action=null and task_state.order_status=null and task_state.item_ids=null and task_state.new_item_ids=null."
+    ],
+    "patch_ops_policy": { "allowed": [
+      { "op": "set", "path": "task_state.resolved" },
+      { "op": "set", "path": "task_state.requested_action" },
+      { "op": "set", "path": "task_state.order_status" },
+      { "op": "set", "path": "task_state.item_ids" },
+      { "op": "set", "path": "task_state.new_item_ids" }
+    ] },
+    "done_when_all": [ "task_state.resolved == true or task_state.requested_action == null" ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.requested_action\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.new_item_ids\",\"value\":null} ] }"
+  },
+
+  "FINALIZE": {
+    "goal_template": "all queued transactions are done — close the task",
+    "reads": ["txn_queue", "requested_action"],
+    "base_actions": [
+      { "tool": "calculate", "args": { "expression": "1" }, "when": "always (no-op carrier)" }
+    ],
+    "executor_sys_rules": [ "Call calculate with expression '1'. No-op." ],
+    "parse_rules": [ "Ignore the result. The transaction queue is empty and all transactions were handled. Set task_state.resolved=true." ],
+    "patch_ops_policy": { "allowed": [ { "op": "set", "path": "task_state.resolved" } ] },
+    "done_when_all": [ "task_state.resolved == true" ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+
+  "ESCALATE": {
+    "goal_template": "transfer to a human agent when the request cannot be completed",
+    "reads": ["goal"],
+    "base_actions": [
+      { "tool": "transfer_to_human_agents", "args": { "summary": "<one-line summary of the request and why it cannot be completed>" }, "when": "task_state.resolved == false and no remaining applicable action" }
+    ],
+    "executor_sys_rules": [ "Transfer (transfer_to_human_agents ONCE) only when no applicable action remains. Concise summary." ],
+    "parse_rules": [ "After 'Transfer successful' set task_state.escalated=true; this ends the workflow." ],
+    "patch_ops_policy": { "allowed": [ { "op": "set", "path": "task_state.escalated" } ] },
+    "done_when_all": [ "task_state.escalated == true" ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.escalated\",\"value\":true} ] }"
+  }
+}

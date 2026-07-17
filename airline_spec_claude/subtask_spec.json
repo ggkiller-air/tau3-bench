@@ -1,0 +1,1547 @@
+{
+  "__about__": "Airline primitives. GET_PLAN folds profile-read + transaction planning + first pop into one call. LOAD_RES extracts ALL veto facts (24h window / flown / cabin / insurance) as explicit true/false booleans — the sequence gates in task_spec.json evaluate them deterministically in Python; an omitted fact stays null and every gate fails closed (no write, clean stop, DB untouched). Each DO_* write carries its own ADVANCE (queue pop) in parse_rules, plus a write_landed retest_guard so the write tool can never fire twice; calculate is the post-write carrier that lets a fumbled ADVANCE be re-emitted without re-writing. DENY_TXN is the no-op refusal: it advances the queue without any write. NOW is the constant 2024-05-15T15:00:00 EST; the 24h window lower bound is the constant string '2024-05-14T15:00:00' (ISO strings compare lexicographically — no date arithmetic anywhere). CHECK_FLOWN/CHECK_FSTAT read each segment's REAL status with get_flight_status(flight_number, date) — 'cancelled' means airline-cancelled, 'landed'/'flying' means already departed, anything else ('available'/'on time'/'delayed') means the segment is intact. NEVER probe status via search_direct_flight: it only lists status=='available' flights, so a merely-delayed future segment would look absent and be misread as cancelled (wrong cancel write), and an airline-cancelled same-day segment would be misread as departed (wrong refusal). CHECK_FLOWN resolves the same-day flown ambiguity (NOW is 15:00 and most 05-15 instances are flying/landed) before any cancel gate can fire. CHECK_UPCOST prices budget-conditional cabin-only changes deterministically before the write gate opens. COMM computes asked-for figures into comm_note (the runner must emit comm_note in the final message — see task_spec __runner_notes__).",
+  "__hilo__": "Recommended SCHEMAFLEX_HILO_VERIFY = GET_PLAN,LOAD_RES,FIND_RES,SEARCH_UPDATE,SEARCH_BOOK,PLAN_BOOK,LOAD_REF,DO_BOOK,DO_CANCEL,DO_UPDATE_FLIGHTS,DENY_TXN,CHECK_UPCOST,COMM,CHECK_FSTAT,CHECK_FLOWN. Recommended SCHEMAFLEX_HIEXEC_SUBTASKS = SEARCH_UPDATE,SEARCH_BOOK,PLAN_BOOK,DO_BOOK,DO_UPDATE_FLIGHTS,DO_UPDATE_PAX,DO_UPDATE_BAGS,CHECK_UPCOST.",
+  "GET_PLAN": {
+    "goal_template": "load the customer profile and compile the request into an ordered transaction queue",
+    "reads": [
+      "goal",
+      "user_id"
+    ],
+    "base_actions": [
+      {
+        "tool": "get_user_details",
+        "args": {
+          "user_id": "<task_state.user_id>"
+        },
+        "when": "task_state.user_loaded == null or the plan is not complete yet"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call get_user_details(user_id=task_state.user_id). Read-only; never call any other tool here."
+    ],
+    "parse_rules": [
+      "The result is the user profile JSON. Set task_state.user_loaded=true. Set task_state.membership to the profile's 'membership' field verbatim ('regular'|'silver'|'gold') — NEVER from what the user claims. Set task_state.candidate_res_ids to the JSON array of the profile's 'reservations', AND set task_state.all_res_ids to the SAME array (pristine copy — it is never consumed). Set task_state.saved_passengers to the profile's 'saved_passengers' array PLUS one extra entry for the USER THEMSELF: {\"first_name\": the profile name.first_name, \"last_name\": the profile name.last_name, \"dob\": the profile 'dob'} — the customer's own dob lives at the profile ROOT, not inside saved_passengers, and later steps may only take DOBs from task_state.saved_passengers. Set task_state.pay_methods to a JSON object mapping every payment_methods key to {\"source\":...,\"amount\":...,\"last_four\":...} (omit subfields that do not exist).",
+      "Then compile the FULL request (the Request text) into an ordered list of transactions, each {\"action\":..., \"reservation_id\": <the reservation id it targets, or null if the user only describes the trip>, \"details\": <the VERBATIM relevant constraints: flights/dates/cabin wanted, budgets, conditions, payment instructions, passenger names and DOBs, baggage counts>, \"reason\": <for a cancel: 'health'|'weather'|'airline_cancelled'|'change_of_plan'|'other'; else null>}. EVERY transaction's details MUST begin with the reservation identification from the request (route/cities/dates/'most recent'), repeated VERBATIM in each entry when several transactions target the SAME reservation.",
+      "Action mapping: cancel a reservation -> 'cancel'. Change flights/dates or cabin class (upgrade/downgrade) of an existing reservation -> 'update_flights'. Fix or replace WHO a passenger is — a name/DOB correction, or 'change the passenger to me/yourself' (headcount unchanged) -> 'update_passengers'. Add checked bags -> 'update_baggages'. Book a brand-NEW reservation -> 'book'. A compound request listing several changes for ONE trip (e.g. cabin upgrade + passenger fix + added bags, in any phrasing or order) compiles into one transaction PER change under this mapping — it is NEVER collapsed into 'deny' just because it has several parts.",
+      "If ONE request both changes the cabin class AND replaces/moves flights of the SAME reservation, emit TWO consecutive 'update_flights' transactions: first {details: the cabin change ONLY, keeping every current flight}, then {details: the flight change at the new cabin}. (The second transaction re-reads the reservation, so a basic-economy ticket upgraded first becomes modifiable.)",
+      "Map to 'deny' (policy-forbidden, will be refused without any write): any compensation / certificate / voucher / goodwill-refund request; adding OR removing insurance on an existing reservation; REMOVING checked bags; changing the NUMBER of passengers (adding or removing a person — NOT replacing/renaming an existing passenger, which is 'update_passengers'); changing origin, destination or trip type of an existing reservation — UNLESS the cancel-and-rebook rule below applies (check that rule BEFORE settling on 'deny'); changing cabin for only ONE segment; changing cabin for only ONE passenger or a subset of the passengers; pure information questions that do NOT ask for a figure to be told. Map to 'transfer' ONLY if the request explicitly asks to be transferred to a human agent. If the request says the user will ask for / wants a transfer to a human agent WHEN a change is refused or impossible, and that change maps to 'deny', emit a {\"action\":\"transfer\"} transaction immediately AFTER that 'deny' transaction. A 'deny' targets the ASK, not the profile: emit exactly ONE 'deny' transaction per forbidden ask, with reservation_id = the specifically named reservation or null — NEVER fan a deny out across the profile's reservation ids.",
+      "If the user asks to move an existing reservation onto a trip with a DIFFERENT origin, destination or trip type (e.g. 'change my DTW->LGA roundtrip to DTW->JFK and back'), does NOT forbid a replacement booking, and a cancel-eligibility fact is stated ANYWHERE in the request in ANY wording (insurance was taken/purchased for the trip plus a health or weather reason — this counts even when the user frames it as 'waive the change fees' or merely 'mentions a health problem'; or the reservation is business cabin; or it was booked <24h ago): compile [cancel{that reservation, reason from the ticket — 'health' when a health problem is mentioned}, book{the requested new trip}] INSTEAD of 'deny'. The book entry's details MUST carry EVERY stated constraint of the new trip verbatim (nonstop/direct, arrival or departure time limits, 'cheapest', cabin, exact dates, named preferred flight numbers, checked bags — any checked bags go into the NEW booking's total_baggages; do NOT emit a separate update_baggages transaction) plus: same passengers as the cancelled reservation, payment = the named method else the cancelled reservation's original payment method, insurance 'yes' only if explicitly wanted for the NEW booking. If the user explicitly refuses a new booking, keep 'deny' (+ 'transfer' if asked).",
+      "If the request asks for a number to be TOLD to the user (a balance, the sum of gift cards or certificates, a total cost, a count), emit a {\"action\":\"comm\"} transaction whose details carry the arithmetic to run and the figures it needs copied verbatim from the profile (e.g. 'sum of gift card balances: 94+218+15'). Never map an asked-for figure to 'deny'. ORDERING: a comm transaction that reports the OUTCOME of writes (total refunded/charged/saved by the cancels, updates or bookings) must be placed LAST in the queue, AFTER every write it depends on — its details say which write deltas to sum; a comm about EXISTING balances or reservation costs may go first. If the figure needs the cost of OTHER reservations, say so in details (COMM will read them via get_reservation_details). A comm about the cost of EXISTING/upcoming reservations must be placed BEFORE any cancel transaction whose reservation it may include.",
+      "The request may state conditional fallbacks whose trigger is a deterministic policy fact ('if it cannot be changed / if it is basic economy, then Y'). Compile the FALLBACK directly instead of the doomed ask: 'upgrade to business first and then cancel (pay with X)' -> emit [update_flights{cabin business, same flights, payment X}, cancel] for that reservation; 'cancel the current one and book a new one' -> emit [cancel, book...] (one 'book' per passenger when the ticket says separate reservations) INSTEAD of the plain update_flights. EXCEPTION 1 — when a conditional fallback spans SEVERAL reservations ('if EITHER of the two is basic economy...'), do NOT compile the fallback here: emit the plain cancel/update transactions and keep the fallback text VERBATIM in each entry's details — the per-reservation decision happens at LOAD_RES once the actual cabin is known. EXCEPTION 2 — NEVER compile an enabling upgrade whose only purpose is to unlock a change that is itself categorically forbidden (origin/destination/trip-type change, passenger add/remove, one-leg or one-passenger cabin change): the forbidden ask stays 'deny' (followed by 'transfer' if the user says they will ask for one), and NO upgrade transaction is emitted.",
+      "If the user asks to cancel/change ALL or SEVERAL reservations, emit ONE entry per reservation id from the profile's reservations list — do NOT pre-filter by POLICY eligibility (ineligible ones are refused later by the gates), but DO restrict to the user's stated SCOPE when it is decidable from the profile (specific ids, routes named in the request). Selection criteria only visible inside a reservation (passenger count, dates, duplicates) are kept VERBATIM in each entry's details — LOAD_RES tests them per reservation. DUPLICATE-MIXUP requests ('I booked multiple flights for the same day by mistake, fix it') state the user's TRUE itinerary ('I arrive in X from Y on D1 and leave Z on D2'): each cancel entry's details MUST then spell the decision rule out explicitly — 'KEEP (do not cancel) any reservation that IS part of this true itinerary: <the stated trips verbatim>, or that belongs to other passengers or unrelated dates; CANCEL only a reservation that CONFLICTS with the true itinerary (another same-day flight out of/into a city that contradicts where the user says they will be)'.",
+      "If a change is conditional on a price/budget, still emit the transaction and keep the condition verbatim in details; the search/pricing step enforces it.",
+      "Set task_state.no_refund_ok=true ONLY when the request explicitly says to proceed with the cancellation even if there is no refund / accepts losing the money; otherwise do not set it.",
+      "Order the transactions per reservation: cabin/flight updates FIRST, then passenger updates, then baggage updates — the baggage allowance is computed on the post-change cabin. Order a booking AFTER the cancel it replaces. Keep denies before writes only when the request makes the write conditional on the denial.",
+      "If the FIRST transaction is a booking that should copy the flights of an existing reservation, set task_state.book_ref to that reservation id. If the FIRST transaction is a booking, also set book_origin/book_destination (IATA codes), book_flight_type ('one_way'|'round_trip'), book_cabin and book_insurance ('yes' only if explicitly wanted) from the request when stated.",
+      "Finally load the FIRST transaction into the working registers: set task_state.txn_action, task_state.reservation_id, task_state.txn_details, task_state.cancel_reason to its values, and set task_state.txn_queue to a JSON array of the REMAINING transactions (null if none remain).",
+      "If txn_queue/txn_action are already set from a previous attempt, only fill in what is still missing."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.user_loaded"
+        },
+        {
+          "op": "set",
+          "path": "task_state.membership"
+        },
+        {
+          "op": "set",
+          "path": "task_state.pay_methods"
+        },
+        {
+          "op": "set",
+          "path": "task_state.saved_passengers"
+        },
+        {
+          "op": "set",
+          "path": "task_state.candidate_res_ids"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_queue"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_action"
+        },
+        {
+          "op": "set",
+          "path": "task_state.reservation_id"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_details"
+        },
+        {
+          "op": "set",
+          "path": "task_state.cancel_reason"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_ref"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_origin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_destination"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_flight_type"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_cabin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_insurance"
+        },
+        {
+          "op": "set",
+          "path": "task_state.all_res_ids"
+        },
+        {
+          "op": "set",
+          "path": "task_state.no_refund_ok"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.user_loaded == true",
+      "task_state.txn_action != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.user_loaded\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.membership\",\"value\":\"gold\"}, {\"op\":\"set\",\"path\":\"task_state.pay_methods\",\"value\":{\"credit_card_2408938\":{\"source\":\"credit_card\",\"last_four\":\"2135\"},\"gift_card_8190333\":{\"source\":\"gift_card\",\"amount\":128}}}, {\"op\":\"set\",\"path\":\"task_state.saved_passengers\",\"value\":[{\"first_name\":\"Omar\",\"last_name\":\"Rossi\",\"dob\":\"1970-06-06\"},{\"first_name\":\"Emma\",\"last_name\":\"Kim\",\"dob\":\"1990-01-01\"}]}, {\"op\":\"set\",\"path\":\"task_state.candidate_res_ids\",\"value\":[\"FQ8APE\",\"XEHM4B\"]}, {\"op\":\"set\",\"path\":\"task_state.all_res_ids\",\"value\":[\"FQ8APE\",\"XEHM4B\"]}, {\"op\":\"set\",\"path\":\"task_state.txn_action\",\"value\":\"cancel\"}, {\"op\":\"set\",\"path\":\"task_state.reservation_id\",\"value\":\"XEHM4B\"}, {\"op\":\"set\",\"path\":\"task_state.txn_details\",\"value\":\"cancel because sick, has insurance\"}, {\"op\":\"set\",\"path\":\"task_state.cancel_reason\",\"value\":\"health\"}, {\"op\":\"set\",\"path\":\"task_state.txn_queue\",\"value\":[{\"action\":\"update_flights\",\"reservation_id\":\"FQ8APE\",\"details\":\"upgrade to business, same flights, pay with gift card\",\"reason\":null}]} ] }"
+  },
+  "FIND_RES": {
+    "goal_template": "locate the current transaction's reservation by walking candidate_res_ids",
+    "reads": [
+      "txn_details",
+      "candidate_res_ids"
+    ],
+    "base_actions": [
+      {
+        "tool": "get_reservation_details",
+        "args": {
+          "reservation_id": "<the FIRST id in task_state.candidate_res_ids>"
+        },
+        "when": "task_state.reservation_id == null"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call get_reservation_details with reservation_id = the FIRST id in task_state.candidate_res_ids. Read-only. Do NOT call any other tool here."
+    ],
+    "parse_rules": [
+      "The result is a reservation JSON. If it matches the current transaction's target described in task_state.txn_details (origin/destination cities, dates, passenger names, 'most recent', ...), set task_state.reservation_id to its 'reservation_id'.",
+      "Otherwise set task_state.candidate_res_ids to the SAME array with its FIRST element removed and do NOT set reservation_id — UNLESS that was the LAST element: then set task_state.candidate_res_ids=null AND set task_state.reservation_id to the literal string 'NONE' (no reservation matched; the transaction will be refused without any write)."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.reservation_id"
+        },
+        {
+          "op": "set",
+          "path": "task_state.candidate_res_ids"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.reservation_id != null or task_state.candidate_res_ids == null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.reservation_id\",\"value\":\"GV1N64\"} ] }"
+  },
+  "LOAD_RES": {
+    "goal_template": "read the current reservation and extract the veto facts + the prepared write arguments",
+    "reads": [
+      "reservation_id",
+      "txn_action",
+      "txn_details",
+      "membership",
+      "pay_methods",
+      "saved_passengers"
+    ],
+    "on_enter_reset": [
+      "res_insurance",
+      "res_flights",
+      "res_passengers",
+      "booked_within_24h",
+      "any_flown",
+      "flight_cancelled",
+      "check_flights",
+      "flights_changed",
+      "cabin_changed",
+      "new_flights",
+      "new_cabin",
+      "update_payment_id",
+      "update_abandoned",
+      "new_total_baggages",
+      "new_nonfree_baggages",
+      "bags_ok",
+      "new_passengers",
+      "write_landed",
+      "search_scratch",
+      "in_scope",
+      "price_check_needed",
+      "res_origin",
+      "res_destination",
+      "res_trip_type",
+      "res_total_baggages",
+      "res_nonfree_baggages"
+    ],
+    "base_actions": [
+      {
+        "tool": "get_reservation_details",
+        "args": {
+          "reservation_id": "<task_state.reservation_id>"
+        },
+        "when": "task_state.res_cabin == null"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call get_reservation_details(reservation_id=task_state.reservation_id). Read-only. Do NOT call any write tool here."
+    ],
+    "parse_rules": [
+      "The result is the reservation JSON. Set task_state.res_cabin to its 'cabin' verbatim ('basic_economy'|'economy'|'business' — basic_economy is NOT economy). Set task_state.res_insurance to its 'insurance' verbatim ('yes'|'no'). Set task_state.res_origin, task_state.res_destination and task_state.res_trip_type to its 'origin', 'destination' and 'flight_type' verbatim. Set task_state.res_flights to a JSON array of its flights as {\"flight_number\":...,\"date\":...,\"origin\":...,\"destination\":...,\"price\":...}. Set task_state.res_passengers to its 'passengers' array verbatim.",
+      "booked_within_24h: compare the reservation's 'created_at' string with '2024-05-14T15:00:00' as PLAIN STRINGS (this format compares correctly character by character). created_at >= '2024-05-14T15:00:00' -> true, otherwise false. ALWAYS set it to true or false, never omit it.",
+      "any_flown: if ANY flight 'date' string is smaller than '2024-05-15', set any_flown=true. For a 'cancel' transaction, if NO date is smaller but SOME date EQUALS '2024-05-15', do NOT set any_flown (leave it null) and set task_state.check_flights to ONLY those same-day segments — whether they already departed must be checked first. Otherwise set any_flown=false. For non-cancel transactions a same-day date counts as NOT flown: set any_flown=false (the environment itself rejects repricing a departed segment).",
+      "If task_state.txn_action is 'cancel' AND any_flown was set to false: set task_state.check_flights to the same array as res_flights (the airline-cancellation check queue).",
+      "ALWAYS set task_state.in_scope for this transaction: false when task_state.txn_details restrict the target (e.g. 'only reservations with one passenger', a named route/date/passenger, 'duplicate' trips) and THIS reservation does not match every stated condition; true when it matches, or when no selection condition is stated. POLARITY for duplicate-mixup cancels: when txn_details state the user's TRUE itinerary and ask to cancel the mistaken duplicates, a reservation that IS one of the stated true trips (the route+date the user says they WILL fly) gets in_scope=false (it must be KEPT), and in_scope=true ONLY for a reservation that CONFLICTS with the true itinerary (a same-day flight that contradicts where the user will be); reservations for OTHER passengers or on unrelated dates get in_scope=false as well.",
+      "If task_state.txn_action is 'update_flights': decide from task_state.txn_details whether the request replaces or moves ANY flight segment (set flights_changed=true) or only changes the cabin class keeping every flight (set flights_changed=false). Decide whether the requested cabin differs from res_cabin (set cabin_changed=true or false). Set new_cabin to the requested cabin, or to res_cabin verbatim when the cabin is not being changed. ALWAYS set flights_changed, cabin_changed and new_cabin for an update_flights transaction. If the change is conditional on a maximum price/budget in txn_details AND flights_changed=false, do NOT set new_flights: set task_state.price_check_needed=true instead (the cost is priced deterministically before any write).",
+      "If flights_changed=false and the change is NOT budget-conditional: set new_flights to the COMPLETE current flight list as a JSON array of {\"flight_number\":...,\"date\":...,\"origin\":...,\"destination\":...} — every segment, copied verbatim, none dropped.",
+      "If task_state.txn_action is 'update_flights' or 'update_baggages': set update_payment_id to a payment id from task_state.pay_methods whose source is 'gift_card' or 'credit_card' — NEVER a certificate. Resolve the user's description: 'card ending in NNNN' -> the credit_card whose last_four is NNNN; 'original payment method' -> the payment_id in THIS reservation's payment_history[0] if its source is gift_card/credit_card; 'gift card with the smallest balance' -> the gift_card with the smallest amount. If no method is named, use this reservation's original payment id when it is a gift/credit card, else the profile's credit card. If the user names a payment TYPE (e.g. 'gift card') that matches SEVERAL methods, use THIS reservation's original payment method when it is of that type; otherwise the one with the largest balance.",
+      "If task_state.txn_action is 'update_passengers': set new_passengers to the COMPLETE passenger array (SAME length, same order) with ONLY the requested change applied. Copy every unchanged passenger and every dob verbatim from the reservation; take a missing dob from task_state.saved_passengers. NEVER invent a dob, never drop a co-passenger.",
+      "If task_state.txn_action is 'update_baggages': set task_state.res_total_baggages and task_state.res_nonfree_baggages verbatim from the reservation's totals. The request says how many bags to ADD. new_total_baggages = res_total_baggages + the number added (the NEW TOTAL, not the increment alone). Free allowance PER PASSENGER by membership x cabin: regular 0/1/2, silver 1/2/3, gold 2/3/4 for basic_economy/economy/business; total allowance = that number times the passenger count. new_nonfree_baggages = max(0, new_total_baggages - total allowance). Set bags_ok=true. If the request would REMOVE bags or lower the totals, set bags_ok=false and do not set the totals.",
+      "If task_state.txn_action is 'cancel', res_cabin is 'basic_economy', NO eligibility branch holds (booked_within_24h false AND res_insurance 'no' AND the reservation is not business), AND task_state.txn_details carry an EXPLICIT upgrade-first-then-cancel fallback for this case: rewrite the transaction NOW — set task_state.new_cabin='business', task_state.flights_changed=false, task_state.cabin_changed=true, task_state.new_flights=the COMPLETE current flight list as [{\"flight_number\":...,\"date\":...,\"origin\":...,\"destination\":...}], task_state.update_payment_id resolved from the fallback's payment instruction, set task_state.txn_action='update_flights', and set task_state.txn_queue to a NEW array with {\"action\":\"cancel\",\"reservation_id\":this reservation's id,\"details\":the original details,\"reason\":the original cancel reason} PUSHED onto the FRONT of the existing queue, and set task_state.any_flown=false and task_state.check_flights=null (after the rewrite the transaction is an update — a null any_flown keeps every doUpdateFlights gate false and stalls silently). If the same details show the fallback but an eligibility branch DOES hold, or the cabin is not basic_economy, do NOT rewrite — the plain cancel proceeds."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.res_cabin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_insurance"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_flights"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_passengers"
+        },
+        {
+          "op": "set",
+          "path": "task_state.booked_within_24h"
+        },
+        {
+          "op": "set",
+          "path": "task_state.any_flown"
+        },
+        {
+          "op": "set",
+          "path": "task_state.check_flights"
+        },
+        {
+          "op": "set",
+          "path": "task_state.flights_changed"
+        },
+        {
+          "op": "set",
+          "path": "task_state.cabin_changed"
+        },
+        {
+          "op": "set",
+          "path": "task_state.new_flights"
+        },
+        {
+          "op": "set",
+          "path": "task_state.new_cabin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.update_payment_id"
+        },
+        {
+          "op": "set",
+          "path": "task_state.new_total_baggages"
+        },
+        {
+          "op": "set",
+          "path": "task_state.new_nonfree_baggages"
+        },
+        {
+          "op": "set",
+          "path": "task_state.bags_ok"
+        },
+        {
+          "op": "set",
+          "path": "task_state.new_passengers"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_origin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_destination"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_trip_type"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_total_baggages"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_nonfree_baggages"
+        },
+        {
+          "op": "set",
+          "path": "task_state.in_scope"
+        },
+        {
+          "op": "set",
+          "path": "task_state.price_check_needed"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_action"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_queue"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.res_cabin != null",
+      "task_state.any_flown != null or task_state.check_flights != null",
+      "task_state.in_scope != null",
+      "task_state.res_insurance != null",
+      "task_state.booked_within_24h != null",
+      "task_state.txn_action != 'update_flights' and task_state.txn_action != 'update_baggages' or task_state.update_payment_id != null",
+      "task_state.txn_action != 'update_flights' or task_state.flights_changed != null",
+      "task_state.txn_action != 'update_flights' or task_state.cabin_changed != null",
+      "task_state.txn_action != 'update_passengers' or task_state.new_passengers != null",
+      "task_state.txn_action != 'update_baggages' or task_state.bags_ok != null",
+      "task_state.txn_action != 'update_baggages' or task_state.bags_ok == false or task_state.new_nonfree_baggages != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.res_cabin\",\"value\":\"basic_economy\"}, {\"op\":\"set\",\"path\":\"task_state.res_insurance\",\"value\":\"no\"}, {\"op\":\"set\",\"path\":\"task_state.res_origin\",\"value\":\"ATL\"}, {\"op\":\"set\",\"path\":\"task_state.res_destination\",\"value\":\"PHL\"}, {\"op\":\"set\",\"path\":\"task_state.res_trip_type\",\"value\":\"one_way\"}, {\"op\":\"set\",\"path\":\"task_state.res_flights\",\"value\":[{\"flight_number\":\"HAT005\",\"date\":\"2024-05-20\",\"origin\":\"ATL\",\"destination\":\"PHL\",\"price\":127}]}, {\"op\":\"set\",\"path\":\"task_state.res_passengers\",\"value\":[{\"first_name\":\"Emma\",\"last_name\":\"Kim\",\"dob\":\"1990-01-01\"}]}, {\"op\":\"set\",\"path\":\"task_state.booked_within_24h\",\"value\":false}, {\"op\":\"set\",\"path\":\"task_state.any_flown\",\"value\":false}, {\"op\":\"set\",\"path\":\"task_state.in_scope\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.check_flights\",\"value\":[{\"flight_number\":\"HAT005\",\"date\":\"2024-05-20\",\"origin\":\"ATL\",\"destination\":\"PHL\",\"price\":127}]} ] }"
+  },
+  "CHECK_FSTAT": {
+    "goal_template": "check whether the airline cancelled any flight of the reservation (last cancel-eligibility leg)",
+    "reads": [
+      "check_flights"
+    ],
+    "base_actions": [
+      {
+        "tool": "get_flight_status",
+        "args": {
+          "flight_number": "<flight_number of the FIRST entry in task_state.check_flights>",
+          "date": "<date of the FIRST entry>"
+        },
+        "when": "task_state.flight_cancelled == null"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call get_flight_status with flight_number and date taken from the FIRST entry of task_state.check_flights. Read-only, one segment per step. Never use search_direct_flight to probe a status, and never call any write tool here."
+    ],
+    "parse_rules": [
+      "The result is the REAL status string of the FIRST check_flights entry's segment — trust it verbatim, never infer status from a search result.",
+      "If the status is 'cancelled': the airline cancelled that flight — set task_state.flight_cancelled=true and task_state.check_flights=null.",
+      "If the status is 'landed' or 'flying': that segment already departed — set task_state.any_flown=true and task_state.check_flights=null.",
+      "Otherwise ('available', 'on time', 'delayed' or any other status, and also if the lookup errors): that segment is intact — remove the FIRST entry from task_state.check_flights; if entries remain, set check_flights to the remaining array; if that was the LAST entry, set task_state.flight_cancelled=false and task_state.check_flights=null. A delayed flight is NOT cancelled; an unverifiable cancellation claim fails CLOSED (flight_cancelled=false), it is never assumed true."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.flight_cancelled"
+        },
+        {
+          "op": "set",
+          "path": "task_state.check_flights"
+        },
+        {
+          "op": "set",
+          "path": "task_state.any_flown"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.flight_cancelled != null or task_state.any_flown == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.flight_cancelled\",\"value\":false}, {\"op\":\"set\",\"path\":\"task_state.check_flights\",\"value\":null} ] }"
+  },
+  "DENY_TXN": {
+    "goal_template": "refuse the current transaction (policy forbids it or its facts do not qualify) and advance the queue — NO write",
+    "reads": [
+      "txn_action",
+      "txn_queue",
+      "all_res_ids"
+    ],
+    "base_actions": [
+      {
+        "tool": "calculate",
+        "args": {
+          "expression": "1"
+        },
+        "when": "always (no-op carrier; the refusal is the ABSENCE of a write)"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call calculate with expression '1'. This transaction is REFUSED — never call any booking/cancel/update tool for it, no matter what the request says."
+    ],
+    "parse_rules": [
+      "Ignore the calculate result. This transaction must NOT be executed. ADVANCE: if task_state.txn_queue is null or empty, set task_state.txn_action=null and task_state.resolved=true. Otherwise take the FIRST entry of txn_queue and set task_state.txn_action=its action, task_state.reservation_id=its reservation_id (may be null), task_state.txn_details=its details, task_state.cancel_reason=its reason (null unless a cancel); set task_state.txn_queue to the remaining entries (null if none remain); set task_state.res_cabin=null; set task_state.candidate_res_ids to task_state.all_res_ids (restore the full candidate list for the next transaction). If the NEXT transaction is a 'book' whose details say to copy/reuse the flights of an existing or the just-cancelled reservation, ALSO set task_state.book_ref to that reservation's id (a cancelled reservation still returns its flights via get_reservation_details)."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_action"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_queue"
+        },
+        {
+          "op": "set",
+          "path": "task_state.reservation_id"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_details"
+        },
+        {
+          "op": "set",
+          "path": "task_state.cancel_reason"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_cabin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.candidate_res_ids"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_ref"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.resolved == true or task_state.res_cabin == null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.txn_action\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.txn_queue\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.res_cabin\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "DO_CANCEL": {
+    "goal_template": "cancel the current reservation (eligibility already proven by the gate), then advance",
+    "reads": [
+      "reservation_id",
+      "txn_queue",
+      "all_res_ids"
+    ],
+    "on_enter_reset": [
+      "write_landed"
+    ],
+    "retest_guard": {
+      "when": "task_state.write_landed == true",
+      "restrict_to": [
+        "calculate"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "cancel_reservation",
+        "args": {
+          "reservation_id": "<task_state.reservation_id>"
+        },
+        "when": "task_state.write_landed != true (call at most once)"
+      },
+      {
+        "tool": "calculate",
+        "args": {
+          "expression": "1"
+        },
+        "when": "the cancel already succeeded (write_landed true) — no-op carrier to finish the advance"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call cancel_reservation(reservation_id=task_state.reservation_id) ONCE. If task_state.write_landed is true, call calculate('1') instead — never cancel twice."
+    ],
+    "parse_rules": [
+      "If the result is the reservation JSON with 'status':'cancelled', the cancel succeeded: set task_state.write_landed=true AND emit the ADVANCE ops in the same patch.",
+      "If the tool was calculate and task_state.write_landed is true, emit the ADVANCE ops now.",
+      "If the result is an error message, set nothing.",
+      "ADVANCE: if task_state.txn_queue is null or empty, set task_state.txn_action=null and task_state.resolved=true. Otherwise take the FIRST entry of txn_queue and set task_state.txn_action=its action, task_state.reservation_id=its reservation_id (may be null), task_state.txn_details=its details, task_state.cancel_reason=its reason (null unless a cancel); set task_state.txn_queue to the remaining entries (null if none remain); set task_state.res_cabin=null; set task_state.candidate_res_ids to task_state.all_res_ids (restore the full candidate list for the next transaction). If the NEXT transaction is a 'book' whose details say to copy/reuse the flights of an existing or the just-cancelled reservation, ALSO set task_state.book_ref to that reservation's id (a cancelled reservation still returns its flights via get_reservation_details)."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.write_landed"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_action"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_queue"
+        },
+        {
+          "op": "set",
+          "path": "task_state.reservation_id"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_details"
+        },
+        {
+          "op": "set",
+          "path": "task_state.cancel_reason"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_cabin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.candidate_res_ids"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_ref"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.resolved == true or task_state.res_cabin == null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.write_landed\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.txn_action\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.txn_queue\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.res_cabin\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "SEARCH_UPDATE": {
+    "goal_template": "search replacement flights for the current update and assemble the COMPLETE new flight list",
+    "reads": [
+      "txn_details",
+      "res_flights",
+      "new_cabin",
+      "search_scratch"
+    ],
+    "base_actions": [
+      {
+        "tool": "search_direct_flight",
+        "args": {
+          "origin": "<segment origin>",
+          "destination": "<segment destination>",
+          "date": "<requested date>"
+        },
+        "when": "a nonstop replacement leg is needed"
+      },
+      {
+        "tool": "search_onestop_flight",
+        "args": {
+          "origin": "<trip origin>",
+          "destination": "<trip destination>",
+          "date": "<requested date>"
+        },
+        "when": "a connecting itinerary is needed or no nonstop exists"
+      }
+    ],
+    "executor_sys_rules": [
+      "Search flights for the requested change. Derive origin/destination/date from task_state.txn_details and the CURRENT segments in task_state.res_flights — origin, destination and trip type of the reservation are IMMUTABLE, so a replaced leg keeps its endpoints.",
+      "One search per step. task_state.search_scratch holds what was already found; search the next missing leg."
+    ],
+    "parse_rules": [
+      "The result is a list of available flights (search_onestop_flight returns PAIRS [leg1,leg2]; a pair's second leg may show date = the NEXT day — keep exactly the dates shown). Only flights in these results are bookable.",
+      "Apply the constraint in task_state.txn_details (cheapest / second cheapest / time window / fastest including layover time / specific flight number) to pick the replacement leg(s). Prices: use the price of task_state.new_cabin.",
+      "If another leg still has to be searched (e.g. the return on a different date), append what you picked so far to task_state.search_scratch as short text and do NOT set new_flights yet.",
+      "When ALL changed legs are picked: set task_state.new_flights to the COMPLETE flight list for the ENTIRE reservation as [{\"flight_number\":...,\"date\":...,\"origin\":...,\"destination\":...}] in trip order — the KEPT segments copied verbatim from task_state.res_flights PLUS the new segments with origin and destination copied VERBATIM from the search result. EVERY segment must be present, including unchanged ones.",
+      "If task_state.txn_details make the change conditional on a maximum total price and the required extra cost exceeds it, or NO offered flight satisfies the constraint: set task_state.update_abandoned=true and do NOT set new_flights (the whole change is then refused)."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.new_flights"
+        },
+        {
+          "op": "set",
+          "path": "task_state.update_abandoned"
+        },
+        {
+          "op": "set",
+          "path": "task_state.search_scratch"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.new_flights != null or task_state.update_abandoned == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.new_flights\",\"value\":[{\"flight_number\":\"HAT056\",\"date\":\"2024-05-25\",\"origin\":\"SEA\",\"destination\":\"DEN\"},{\"flight_number\":\"HAT138\",\"date\":\"2024-05-25\",\"origin\":\"DEN\",\"destination\":\"MCO\"}]} ] }"
+  },
+  "DO_UPDATE_FLIGHTS": {
+    "goal_template": "write the flight/cabin update (legality already proven by the gate), then advance",
+    "reads": [
+      "reservation_id",
+      "new_cabin",
+      "new_flights",
+      "update_payment_id",
+      "txn_queue",
+      "all_res_ids"
+    ],
+    "on_enter_reset": [
+      "write_landed"
+    ],
+    "retest_guard": {
+      "when": "task_state.write_landed == true",
+      "restrict_to": [
+        "calculate"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "update_reservation_flights",
+        "args": {
+          "reservation_id": "<task_state.reservation_id>",
+          "cabin": "<task_state.new_cabin>",
+          "flights": "<task_state.new_flights VERBATIM>",
+          "payment_id": "<task_state.update_payment_id>"
+        },
+        "when": "task_state.write_landed != true (call at most once)"
+      },
+      {
+        "tool": "calculate",
+        "args": {
+          "expression": "1"
+        },
+        "when": "the update already succeeded — no-op carrier to finish the advance"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call update_reservation_flights(reservation_id=task_state.reservation_id, cabin=task_state.new_cabin, flights=task_state.new_flights copied VERBATIM — every segment, objects with flight_number, date, origin and destination — payment_id=task_state.update_payment_id). Never drop a kept segment, never edit the list.",
+      "If task_state.write_landed is true, call calculate('1') instead — never write twice."
+    ],
+    "parse_rules": [
+      "If the result is the updated reservation JSON, the update succeeded: set task_state.write_landed=true AND emit the ADVANCE ops in the same patch. Also read the NEW last entry of the result's payment_history and APPEND a short clause to task_state.comm_note: the new value = the EXISTING comm_note + '; ' + the new clause — NEVER discard or rewrite earlier entries, every prior reservation's delta must survive verbatim (e.g. 'update FQ8APE: charged 344' or 'update FQ8APE: refunded 100') — a later comm transaction may have to report these exact deltas.",
+      "If the tool was calculate and task_state.write_landed is true, emit the ADVANCE ops now.",
+      "If the result is an error saying a flight is not available: when task_state.flights_changed == true, set task_state.new_flights=null (a new search will run); when task_state.flights_changed == false (cabin-only change), set task_state.update_abandoned=true AND task_state.new_flights=null — the change is impossible (a segment already departed) and must be refused WITHOUT a write. If the error mentions the payment method or certificate: set task_state.update_payment_id to the credit_card id in task_state.pay_methods. Do NOT advance on errors.",
+      "ADVANCE: if task_state.txn_queue is null or empty, set task_state.txn_action=null and task_state.resolved=true. Otherwise take the FIRST entry of txn_queue and set task_state.txn_action=its action, task_state.reservation_id=its reservation_id (may be null), task_state.txn_details=its details, task_state.cancel_reason=its reason (null unless a cancel); set task_state.txn_queue to the remaining entries (null if none remain); set task_state.res_cabin=null; set task_state.candidate_res_ids to task_state.all_res_ids (restore the full candidate list for the next transaction)."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.write_landed"
+        },
+        {
+          "op": "set",
+          "path": "task_state.new_flights"
+        },
+        {
+          "op": "set",
+          "path": "task_state.update_payment_id"
+        },
+        {
+          "op": "set",
+          "path": "task_state.update_abandoned"
+        },
+        {
+          "op": "set",
+          "path": "task_state.comm_note"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_action"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_queue"
+        },
+        {
+          "op": "set",
+          "path": "task_state.reservation_id"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_details"
+        },
+        {
+          "op": "set",
+          "path": "task_state.cancel_reason"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_cabin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.candidate_res_ids"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.resolved == true or task_state.res_cabin == null or task_state.new_flights == null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.write_landed\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.txn_action\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.txn_queue\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.res_cabin\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "DO_UPDATE_PAX": {
+    "goal_template": "write the passenger update (full same-length list), then advance",
+    "reads": [
+      "reservation_id",
+      "new_passengers",
+      "txn_queue",
+      "all_res_ids"
+    ],
+    "on_enter_reset": [
+      "write_landed"
+    ],
+    "retest_guard": {
+      "when": "task_state.write_landed == true",
+      "restrict_to": [
+        "calculate"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "update_reservation_passengers",
+        "args": {
+          "reservation_id": "<task_state.reservation_id>",
+          "passengers": "<task_state.new_passengers VERBATIM>"
+        },
+        "when": "task_state.write_landed != true (call at most once)"
+      },
+      {
+        "tool": "calculate",
+        "args": {
+          "expression": "1"
+        },
+        "when": "the update already succeeded — no-op carrier"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call update_reservation_passengers(reservation_id=task_state.reservation_id, passengers=task_state.new_passengers copied VERBATIM — the complete list, same number of passengers). If task_state.write_landed is true, call calculate('1') instead."
+    ],
+    "parse_rules": [
+      "If the result is the updated reservation JSON, set task_state.write_landed=true AND emit the ADVANCE ops in the same patch.",
+      "If the tool was calculate and task_state.write_landed is true, emit the ADVANCE ops now.",
+      "If the result is an error, set nothing.",
+      "ADVANCE: if task_state.txn_queue is null or empty, set task_state.txn_action=null and task_state.resolved=true. Otherwise take the FIRST entry of txn_queue and set task_state.txn_action=its action, task_state.reservation_id=its reservation_id (may be null), task_state.txn_details=its details, task_state.cancel_reason=its reason (null unless a cancel); set task_state.txn_queue to the remaining entries (null if none remain); set task_state.res_cabin=null; set task_state.candidate_res_ids to task_state.all_res_ids (restore the full candidate list for the next transaction)."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.write_landed"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_action"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_queue"
+        },
+        {
+          "op": "set",
+          "path": "task_state.reservation_id"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_details"
+        },
+        {
+          "op": "set",
+          "path": "task_state.cancel_reason"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_cabin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.candidate_res_ids"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.resolved == true or task_state.res_cabin == null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.write_landed\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.txn_action\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.txn_queue\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.res_cabin\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "DO_UPDATE_BAGS": {
+    "goal_template": "write the baggage update (new totals already derived), then advance",
+    "reads": [
+      "reservation_id",
+      "new_total_baggages",
+      "new_nonfree_baggages",
+      "update_payment_id",
+      "txn_queue",
+      "all_res_ids"
+    ],
+    "on_enter_reset": [
+      "write_landed"
+    ],
+    "retest_guard": {
+      "when": "task_state.write_landed == true",
+      "restrict_to": [
+        "calculate"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "update_reservation_baggages",
+        "args": {
+          "reservation_id": "<task_state.reservation_id>",
+          "total_baggages": "<task_state.new_total_baggages>",
+          "nonfree_baggages": "<task_state.new_nonfree_baggages>",
+          "payment_id": "<task_state.update_payment_id>"
+        },
+        "when": "task_state.write_landed != true (call at most once)"
+      },
+      {
+        "tool": "calculate",
+        "args": {
+          "expression": "1"
+        },
+        "when": "the update already succeeded — no-op carrier"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call update_reservation_baggages(reservation_id=task_state.reservation_id, total_baggages=task_state.new_total_baggages, nonfree_baggages=task_state.new_nonfree_baggages, payment_id=task_state.update_payment_id) — the totals are ALREADY computed, copy them verbatim. If task_state.write_landed is true, call calculate('1') instead."
+    ],
+    "parse_rules": [
+      "If the result is the updated reservation JSON, set task_state.write_landed=true AND emit the ADVANCE ops in the same patch.",
+      "If the tool was calculate and task_state.write_landed is true, emit the ADVANCE ops now.",
+      "If the result is an error mentioning the payment method or certificate: set task_state.update_payment_id to the credit_card id in task_state.pay_methods. Do NOT advance on errors.",
+      "ADVANCE: if task_state.txn_queue is null or empty, set task_state.txn_action=null and task_state.resolved=true. Otherwise take the FIRST entry of txn_queue and set task_state.txn_action=its action, task_state.reservation_id=its reservation_id (may be null), task_state.txn_details=its details, task_state.cancel_reason=its reason (null unless a cancel); set task_state.txn_queue to the remaining entries (null if none remain); set task_state.res_cabin=null; set task_state.candidate_res_ids to task_state.all_res_ids (restore the full candidate list for the next transaction)."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.write_landed"
+        },
+        {
+          "op": "set",
+          "path": "task_state.update_payment_id"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_action"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_queue"
+        },
+        {
+          "op": "set",
+          "path": "task_state.reservation_id"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_details"
+        },
+        {
+          "op": "set",
+          "path": "task_state.cancel_reason"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_cabin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.candidate_res_ids"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.resolved == true or task_state.res_cabin == null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.write_landed\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.txn_action\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.txn_queue\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.res_cabin\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "LOAD_REF": {
+    "goal_template": "read the reservation whose flights the new booking should copy",
+    "reads": [
+      "book_ref",
+      "txn_details"
+    ],
+    "base_actions": [
+      {
+        "tool": "get_reservation_details",
+        "args": {
+          "reservation_id": "<task_state.book_ref>"
+        },
+        "when": "task_state.book_ref != null"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call get_reservation_details(reservation_id=task_state.book_ref). Read-only."
+    ],
+    "parse_rules": [
+      "The result is the referenced reservation JSON. Set task_state.book_flights to its flights as [{\"flight_number\":...,\"date\":...}] — if the request books for DIFFERENT date(s), keep the flight_numbers but use the requested date(s).",
+      "Set task_state.book_passengers from its passengers (apply additions/removals stated in the request; a NEW passenger's dob comes from the request, an existing passenger's dob is copied verbatim).",
+      "Set task_state.book_origin, book_destination, book_flight_type and book_cabin from it unless the request overrides them.",
+      "Set task_state.book_price_expr to an arithmetic expression for the new total using this reservation's per-segment prices, passenger count, insurance (30 per passenger if 'yes') and 50 per non-free bag, e.g. '(142+263)*2+30*2'. (If dates changed, prices may differ — the booking step corrects the total from the API error.)",
+      "Set task_state.book_ref=null (consumed)."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.book_ref"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_flights"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_passengers"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_origin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_destination"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_flight_type"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_cabin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_price_expr"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.book_ref == null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.book_flights\",\"value\":[{\"flight_number\":\"HAT001\",\"date\":\"2024-05-20\"}]}, {\"op\":\"set\",\"path\":\"task_state.book_passengers\",\"value\":[{\"first_name\":\"Sofia\",\"last_name\":\"Kim\",\"dob\":\"1996-11-04\"}]}, {\"op\":\"set\",\"path\":\"task_state.book_origin\",\"value\":\"EWR\"}, {\"op\":\"set\",\"path\":\"task_state.book_destination\",\"value\":\"SEA\"}, {\"op\":\"set\",\"path\":\"task_state.book_flight_type\",\"value\":\"one_way\"}, {\"op\":\"set\",\"path\":\"task_state.book_cabin\",\"value\":\"economy\"}, {\"op\":\"set\",\"path\":\"task_state.book_price_expr\",\"value\":\"(142)*1\"}, {\"op\":\"set\",\"path\":\"task_state.book_ref\",\"value\":null} ] }"
+  },
+  "SEARCH_BOOK": {
+    "goal_template": "search and choose the flights for the new booking under the request's constraints",
+    "reads": [
+      "txn_details",
+      "book_origin",
+      "book_destination",
+      "book_cabin",
+      "search_scratch"
+    ],
+    "on_enter_reset": [
+      "search_scratch"
+    ],
+    "base_actions": [
+      {
+        "tool": "search_direct_flight",
+        "args": {
+          "origin": "<IATA>",
+          "destination": "<IATA>",
+          "date": "<YYYY-MM-DD>"
+        },
+        "when": "a nonstop candidate is needed"
+      },
+      {
+        "tool": "search_onestop_flight",
+        "args": {
+          "origin": "<IATA>",
+          "destination": "<IATA>",
+          "date": "<YYYY-MM-DD>"
+        },
+        "when": "a connecting candidate is needed or no nonstop exists"
+      },
+      {
+        "tool": "list_all_airports",
+        "args": {},
+        "when": "a city must be mapped to IATA code(s) first (e.g. 'any West Coast city')"
+      }
+    ],
+    "executor_sys_rules": [
+      "Search the trip requested in task_state.txn_details. One tool call per step. If several origins/destinations must be compared ('cheapest from EWR or JFK to any West Coast city'), search each pair on its own step; task_state.search_scratch holds options already seen.",
+      "A round trip needs the return leg searched too (destination -> origin on the return date)."
+    ],
+    "parse_rules": [
+      "The result is a list of available flights (search_onestop_flight returns PAIRS [leg1,leg2]; the second leg's date may be the NEXT day — keep the dates exactly as shown). Only flights from these results may be booked.",
+      "Apply the constraint from task_state.txn_details (cheapest / second cheapest / departure-time window / date) using the prices of the requested cabin. If more searches are still needed (other origin/destination/date, the return leg), append a short summary of the best candidates so far to task_state.search_scratch and do NOT set book_flights yet.",
+      "When the itinerary is fully chosen: set task_state.book_flights to [{\"flight_number\":...,\"date\":...}] in trip order (a one-stop trip contributes TWO entries per direction, in order). Set book_origin/book_destination (IATA) and book_flight_type ('one_way'|'round_trip') and book_cabin if not already set.",
+      "Set task_state.book_price_expr to an arithmetic expression of the total: (sum of chosen segment prices in the chosen cabin)*number of passengers, plus 30*passengers if insurance is wanted, plus 50*non-free bags, e.g. '(142+263)*2+30*2+50*0'.",
+      "If the request has a fallback condition (e.g. 'if the total exceeds 500, drop the second passenger'), apply it HERE using the found prices and note the decision in search_scratch."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.book_flights"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_origin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_destination"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_flight_type"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_cabin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_price_expr"
+        },
+        {
+          "op": "set",
+          "path": "task_state.search_scratch"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.book_flights != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.book_flights\",\"value\":[{\"flight_number\":\"HAT097\",\"date\":\"2024-05-16\"},{\"flight_number\":\"HAT251\",\"date\":\"2024-05-17\"}]}, {\"op\":\"set\",\"path\":\"task_state.book_origin\",\"value\":\"JFK\"}, {\"op\":\"set\",\"path\":\"task_state.book_destination\",\"value\":\"SEA\"}, {\"op\":\"set\",\"path\":\"task_state.book_flight_type\",\"value\":\"one_way\"}, {\"op\":\"set\",\"path\":\"task_state.book_cabin\",\"value\":\"economy\"}, {\"op\":\"set\",\"path\":\"task_state.book_price_expr\",\"value\":\"(122+250)*1\"} ] }"
+  },
+  "PLAN_BOOK": {
+    "goal_template": "compute the exact total with calculate and assemble passengers + the payment split",
+    "reads": [
+      "book_price_expr",
+      "txn_details",
+      "pay_methods",
+      "saved_passengers",
+      "membership",
+      "book_cabin",
+      "book_insurance"
+    ],
+    "base_actions": [
+      {
+        "tool": "calculate",
+        "args": {
+          "expression": "<task_state.book_price_expr>"
+        },
+        "when": "always — the exact total must come from calculate, never from mental arithmetic"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call calculate(expression=task_state.book_price_expr). If book_price_expr is null, use '0' (the booking step will correct the total from the API)."
+    ],
+    "parse_rules": [
+      "The result is the exact total price. Set task_state.book_total to that number.",
+      "Set task_state.book_passengers (unless already set): a JSON array [{\"first_name\":...,\"last_name\":...,\"dob\":\"YYYY-MM-DD\"}] for EVERY traveller of this booking. DOBs come from task_state.saved_passengers, the request text, or the copied reservation — NEVER invented.",
+      "Set task_state.book_payment: a JSON array of {\"payment_id\":...,\"amount\":...} using ONLY ids present in task_state.pay_methods, following the request. HARD LIMITS: at most ONE certificate, at most ONE credit card, at most THREE gift cards per reservation; a certificate/gift amount must not exceed its balance; a certificate's unused remainder is FORFEITED (so apply min(certificate balance, remaining total)); if the user offers several certificates only the single allowed one may be used. The amounts must sum EXACTLY to book_total — put the residual on the credit card (or gift card) the request designates.",
+      "Set task_state.book_total_baggages and book_nonfree_baggages: bags stated in the request; free allowance PER PASSENGER by membership x cabin: regular 0/1/2, silver 1/2/3, gold 2/3/4 for basic_economy/economy/business; nonfree = max(0, total - allowance*passenger count). Use 0 and 0 if no bags are mentioned.",
+      "Set task_state.book_insurance ('yes' ONLY if the request explicitly wants insurance, else 'no') and task_state.book_cabin if still null."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.book_total"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_passengers"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_payment"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_total_baggages"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_nonfree_baggages"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_insurance"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_cabin"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.book_payment != null",
+      "task_state.book_passengers != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.book_total\",\"value\":255}, {\"op\":\"set\",\"path\":\"task_state.book_passengers\",\"value\":[{\"first_name\":\"Mia\",\"last_name\":\"Kim\",\"dob\":\"1989-12-13\"}]}, {\"op\":\"set\",\"path\":\"task_state.book_payment\",\"value\":[{\"payment_id\":\"certificate_7502997\",\"amount\":250},{\"payment_id\":\"credit_card_3576581\",\"amount\":5}]}, {\"op\":\"set\",\"path\":\"task_state.book_total_baggages\",\"value\":0}, {\"op\":\"set\",\"path\":\"task_state.book_nonfree_baggages\",\"value\":0}, {\"op\":\"set\",\"path\":\"task_state.book_insurance\",\"value\":\"no\"} ] }"
+  },
+  "DO_BOOK": {
+    "goal_template": "write the booking from the prepared registers, then advance",
+    "reads": [
+      "user_id",
+      "book_origin",
+      "book_destination",
+      "book_flight_type",
+      "book_cabin",
+      "book_flights",
+      "book_passengers",
+      "book_payment",
+      "book_total_baggages",
+      "book_nonfree_baggages",
+      "book_insurance",
+      "txn_queue",
+      "all_res_ids"
+    ],
+    "on_enter_reset": [
+      "write_landed"
+    ],
+    "retest_guard": {
+      "when": "task_state.write_landed == true",
+      "restrict_to": [
+        "calculate"
+      ]
+    },
+    "base_actions": [
+      {
+        "tool": "book_reservation",
+        "args": {
+          "user_id": "<task_state.user_id>",
+          "origin": "<task_state.book_origin>",
+          "destination": "<task_state.book_destination>",
+          "flight_type": "<task_state.book_flight_type>",
+          "cabin": "<task_state.book_cabin>",
+          "flights": "<task_state.book_flights VERBATIM>",
+          "passengers": "<task_state.book_passengers VERBATIM>",
+          "payment_methods": "<task_state.book_payment VERBATIM>",
+          "total_baggages": "<task_state.book_total_baggages or 0>",
+          "nonfree_baggages": "<task_state.book_nonfree_baggages or 0>",
+          "insurance": "<task_state.book_insurance or 'no'>"
+        },
+        "when": "task_state.write_landed != true (call at most once per successful booking)"
+      },
+      {
+        "tool": "calculate",
+        "args": {
+          "expression": "1"
+        },
+        "when": "the booking already succeeded — no-op carrier to finish the advance"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call book_reservation with every argument copied VERBATIM from task_state: user_id, origin=book_origin, destination=book_destination, flight_type=book_flight_type, cabin=book_cabin, flights=book_flights, passengers=book_passengers, payment_methods=book_payment, total_baggages=book_total_baggages (0 if null), nonfree_baggages=book_nonfree_baggages (0 if null), insurance=book_insurance ('no' if null). Do not add, drop or edit any entry.",
+      "If task_state.write_landed is true, call calculate('1') instead — never book twice."
+    ],
+    "parse_rules": [
+      "If the result is a reservation JSON with a NEW reservation_id, the booking succeeded: set task_state.write_landed=true AND emit the ADVANCE ops in the same patch. Also APPEND a short clause to task_state.comm_note (new value = the EXISTING comm_note + '; ' + the new clause — NEVER discard or rewrite earlier entries), listing each amount actually charged per payment_id from the result's payment_history (e.g. 'booking 1: 250 on certificate_7502997, 5 on credit_card_3576581') — a later comm transaction may have to sum these exact residuals.",
+      "If the tool was calculate and task_state.write_landed is true, emit the ADVANCE ops now.",
+      "If the result is the error 'Payment amount does not add up, total price is X, but paid Y': fix task_state.book_payment so the amounts sum EXACTLY to X — keep the certificate amount at min(certificate balance, X) and adjust the credit-card/gift-card residual; also set task_state.book_total=X. Do NOT advance.",
+      "If the result says a flight is not available or not enough seats: set task_state.book_flights=null and task_state.book_payment=null (a new search will run). Do NOT advance.",
+      "ADVANCE: if task_state.txn_queue is null or empty, set task_state.txn_action=null and task_state.resolved=true, and set book_flights=null, book_payment=null and book_passengers=null. Otherwise take the FIRST entry of txn_queue and set task_state.txn_action=its action, task_state.reservation_id=its reservation_id (may be null), task_state.txn_details=its details, task_state.cancel_reason=its reason (null unless a cancel); set task_state.txn_queue to the remaining entries (null if none remain); set task_state.res_cabin=null; set task_state.candidate_res_ids to task_state.all_res_ids (restore the full candidate list). If the NEXT transaction is another booking on the SAME flights, keep book_flights/book_cabin/book_origin/book_destination/book_flight_type/book_price_expr and set ONLY book_payment=null and book_passengers=null. OTHERWISE — the next transaction is a booking on DIFFERENT flights, or is NOT a booking — set book_flights=null, book_payment=null and book_passengers=null."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.write_landed"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_total"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_payment"
+        },
+        {
+          "op": "set",
+          "path": "task_state.comm_note"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_passengers"
+        },
+        {
+          "op": "set",
+          "path": "task_state.book_flights"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_action"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_queue"
+        },
+        {
+          "op": "set",
+          "path": "task_state.reservation_id"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_details"
+        },
+        {
+          "op": "set",
+          "path": "task_state.cancel_reason"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_cabin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.candidate_res_ids"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.resolved == true or task_state.book_payment == null or task_state.txn_action != 'book'"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.write_landed\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.txn_action\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.txn_queue\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.res_cabin\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "DO_TRANSFER": {
+    "goal_template": "transfer to a human agent (only when the request explicitly requires it), then advance",
+    "reads": [
+      "goal",
+      "txn_details",
+      "txn_queue",
+      "all_res_ids"
+    ],
+    "base_actions": [
+      {
+        "tool": "transfer_to_human_agents",
+        "args": {
+          "summary": "<one-line summary of the request and why it is out of scope>"
+        },
+        "when": "task_state.escalated != true"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call transfer_to_human_agents ONCE with a concise summary. Never call any booking/cancel/update tool here."
+    ],
+    "parse_rules": [
+      "After a successful transfer set task_state.escalated=true, then ADVANCE: if task_state.txn_queue is null or empty, set task_state.txn_action=null and task_state.resolved=true. Otherwise take the FIRST entry of txn_queue and set task_state.txn_action=its action, task_state.reservation_id=its reservation_id (may be null), task_state.txn_details=its details, task_state.cancel_reason=its reason (null unless a cancel); set task_state.txn_queue to the remaining entries (null if none remain); set task_state.res_cabin=null; set task_state.candidate_res_ids to task_state.all_res_ids (restore the full candidate list for the next transaction)."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.escalated"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_action"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_queue"
+        },
+        {
+          "op": "set",
+          "path": "task_state.reservation_id"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_details"
+        },
+        {
+          "op": "set",
+          "path": "task_state.cancel_reason"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_cabin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.candidate_res_ids"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.escalated == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.escalated\",\"value\":true}, {\"op\":\"set\",\"path\":\"task_state.txn_action\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.txn_queue\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "FINALIZE": {
+    "goal_template": "every transaction was executed or refused — close the task",
+    "reads": [
+      "txn_queue",
+      "txn_action"
+    ],
+    "base_actions": [
+      {
+        "tool": "calculate",
+        "args": {
+          "expression": "1"
+        },
+        "when": "always (no-op carrier)"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call calculate with expression '1'. No-op."
+    ],
+    "parse_rules": [
+      "Ignore the result. The transaction queue is empty and every transaction was handled. Set task_state.resolved=true."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.resolved == true"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  },
+  "CHECK_FLOWN": {
+    "goal_template": "decide whether any same-day (2024-05-15) segment already departed — the flown check that precedes cancel eligibility",
+    "reads": [
+      "check_flights",
+      "res_flights"
+    ],
+    "base_actions": [
+      {
+        "tool": "get_flight_status",
+        "args": {
+          "flight_number": "<flight_number of the FIRST entry in task_state.check_flights>",
+          "date": "<date of the FIRST entry>"
+        },
+        "when": "task_state.any_flown == null"
+      }
+    ],
+    "executor_sys_rules": [
+      "Call get_flight_status with flight_number and date taken from the FIRST entry of task_state.check_flights. Read-only, one segment per step. Never use search_direct_flight to probe a status, and never call any write tool here."
+    ],
+    "parse_rules": [
+      "The result is the REAL status string of the FIRST check_flights entry's same-day segment — trust it verbatim, never infer status from a search result.",
+      "If the status is 'landed' or 'flying': that same-day segment already departed — set task_state.any_flown=true and task_state.check_flights=null.",
+      "If the status is 'cancelled': the airline cancelled that segment, so it never departed — set task_state.any_flown=false, task_state.flight_cancelled=true and task_state.check_flights=null (the cancel becomes eligible through the airline-cancelled branch).",
+      "Otherwise ('available', 'on time', 'delayed' or any other status): that same-day segment has NOT departed — remove the FIRST entry from task_state.check_flights; if entries remain, set check_flights to the remaining array; if that was the LAST entry, set task_state.any_flown=false AND set task_state.check_flights to the FULL task_state.res_flights array (the airline-cancellation check walks it next)."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.any_flown"
+        },
+        {
+          "op": "set",
+          "path": "task_state.check_flights"
+        },
+        {
+          "op": "set",
+          "path": "task_state.flight_cancelled"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.any_flown != null"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.any_flown\",\"value\":false}, {\"op\":\"set\",\"path\":\"task_state.check_flights\",\"value\":[{\"flight_number\":\"HAT005\",\"date\":\"2024-05-20\",\"origin\":\"ATL\",\"destination\":\"PHL\",\"price\":127}]} ] }"
+  },
+  "CHECK_UPCOST": {
+    "goal_template": "price the budget-conditional cabin change deterministically BEFORE any write",
+    "reads": [
+      "txn_details",
+      "res_flights",
+      "res_cabin",
+      "new_cabin",
+      "res_passengers",
+      "search_scratch"
+    ],
+    "on_enter_reset": [
+      "search_scratch"
+    ],
+    "base_actions": [
+      {
+        "tool": "search_direct_flight",
+        "args": {
+          "origin": "<segment origin>",
+          "destination": "<segment destination>",
+          "date": "<segment date>"
+        },
+        "when": "a segment's target-cabin price is still unknown (one segment of task_state.res_flights per step)"
+      },
+      {
+        "tool": "calculate",
+        "args": {
+          "expression": "<sum over segments of (new-cabin price - price already paid), times the passenger count>"
+        },
+        "when": "every segment price is in search_scratch — compute the exact extra cost"
+      }
+    ],
+    "executor_sys_rules": [
+      "For each segment in task_state.res_flights, call search_direct_flight(origin, destination, date of that segment) to read its price in task_state.new_cabin. One search per step; task_state.search_scratch holds the prices already found.",
+      "When every segment's new price is known, call calculate with the extra-cost expression: (sum over segments of the new-cabin price minus that segment's already-paid 'price' from task_state.res_flights) times the number of passengers, e.g. '((499-127)+(350-122))*2'."
+    ],
+    "parse_rules": [
+      "If the result is a flight list: find the searched segment's flight_number and read its price for task_state.new_cabin; append 'FLIGHTNUMBER new NNN paid MMM' to task_state.search_scratch (MMM = that segment's 'price' in task_state.res_flights). Do NOT set any other field yet.",
+      "If the result is a number (calculate): that is the exact extra cost of the cabin change. Compare it with the maximum budget stated in task_state.txn_details: if the extra cost EXCEEDS the budget, set task_state.update_abandoned=true — the change is refused, nothing will be written. Otherwise set task_state.new_flights to the COMPLETE current flight list copied verbatim from task_state.res_flights as [{\"flight_number\":...,\"date\":...,\"origin\":...,\"destination\":...}] AND set task_state.price_check_needed=false."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.search_scratch"
+        },
+        {
+          "op": "set",
+          "path": "task_state.update_abandoned"
+        },
+        {
+          "op": "set",
+          "path": "task_state.new_flights"
+        },
+        {
+          "op": "set",
+          "path": "task_state.price_check_needed"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.update_abandoned == true or task_state.price_check_needed == false"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.update_abandoned\",\"value\":true} ] }"
+  },
+  "COMM": {
+    "goal_template": "compute the exact figure(s) the user asked to be told and record them for the final report — NO write",
+    "on_enter_reset": [
+      "search_scratch"
+    ],
+    "reads": [
+      "txn_details",
+      "pay_methods",
+      "comm_note",
+      "search_scratch",
+      "txn_queue",
+      "all_res_ids",
+      "membership"
+    ],
+    "base_actions": [
+      {
+        "tool": "get_reservation_details",
+        "args": {
+          "reservation_id": "<the next id from task_state.all_res_ids whose cost is not yet in task_state.search_scratch>"
+        },
+        "when": "the asked figure needs the cost of another reservation that is not yet in search_scratch — one reservation per step"
+      },
+      {
+        "tool": "calculate",
+        "args": {
+          "expression": "<the arithmetic for the asked figure>"
+        },
+        "when": "every number the arithmetic needs is already in txn_details, comm_note or search_scratch — the reported figure must come from calculate, never from mental arithmetic"
+      }
+    ],
+    "executor_sys_rules": [
+      "If the figure asked in task_state.txn_details needs the COST of other reservations, first call get_reservation_details on the relevant ids in task_state.all_res_ids, ONE per step, until every needed cost is in task_state.search_scratch. NEVER re-read an id that already appears in task_state.search_scratch — pick the next missing one; when every relevant id is recorded (including 'excluded' entries), move on to calculate.",
+      "If the asked figure is a FREE-BAGGAGE ALLOWANCE, read that reservation ONCE via get_reservation_details; once task_state.search_scratch carries its 'allowance_per_pax N' and 'passengers M' facts, the calculate expression MUST be exactly 'N * M' (e.g. '2 * 2') — never any other formula.",
+      "Then call calculate ONCE PER ASKED FIGURE, with the arithmetic expression assembled from task_state.txn_details plus the figures accumulated in task_state.search_scratch and task_state.comm_note (e.g. the listed gift-card balances joined with '+', or the refunded/charged write deltas recorded in comm_note). If txn_details ask for SEVERAL separate figures (e.g. 'sum of gift card balances' AND 'sum of certificate balances'), compute each with its OWN calculate call, one per step — never merge them into a single total. The expression must contain the actual numbers; NEVER call calculate with a placeholder like '1'. Never call any booking/cancel/update tool here."
+    ],
+    "parse_rules": [
+      "If the result is a reservation JSON (get_reservation_details): what to record in task_state.search_scratch depends on the asked figure. For a COST figure, APPEND '<reservation_id> cost NNN', where NNN is that reservation's total cost (sum of its flights' prices times its passenger count, plus 30 per passenger if insurance is 'yes', plus 50 per nonfree bag — copy the raw numbers, the final figure still comes from calculate). For a FREE-BAGGAGE ALLOWANCE figure, APPEND '<reservation_id> cabin <cabin>, passengers <count>, membership <task_state.membership>, allowance_per_pax <N>' where N comes from the matrix: regular 0/1/2, silver 1/2/3, gold 2/3/4 for basic_economy/economy/business (membership from the PROFILE via task_state.membership, never from the user's claim). If the reservation is NOT upcoming for an 'upcoming'-scoped ask (any flight date < '2024-05-15'), APPEND '<reservation_id> excluded (not upcoming)' instead. If this reservation_id is ALREADY recorded in search_scratch, append NOTHING. Set NOTHING else and do NOT advance yet.",
+      "If the result is a number (calculate): that is ONE of the figures the user asked for. APPEND it to task_state.comm_note as a short labeled clause keeping any earlier content (e.g. 'gift cards total 327; certificates total 1000') — the number VERBATIM as computed, but strip a trailing '.0' (write 327, not 327.0). Every asked-for figure must appear exactly as computed — these numbers are reported to the user at the end.",
+      "Then ADVANCE — ONLY in the same patch as a calculate result (never after a get_reservation_details read), and ONLY when EVERY figure asked in txn_details has been computed and recorded in comm_note; if another asked figure is still missing, set comm_note and NOTHING else (the next step computes it): if task_state.txn_queue is null or empty, set task_state.txn_action=null and task_state.resolved=true. Otherwise take the FIRST entry of txn_queue and set task_state.txn_action=its action, task_state.reservation_id=its reservation_id (may be null), task_state.txn_details=its details, task_state.cancel_reason=its reason (null unless a cancel); set task_state.txn_queue to the remaining entries (null if none remain); set task_state.res_cabin=null; set task_state.candidate_res_ids to task_state.all_res_ids (restore the full candidate list for the next transaction); set task_state.search_scratch=null (the next transaction starts with a clean scratch).",
+      "If the asked figure is a free-baggage allowance: the per-passenger allowance comes from the matrix (regular 0/1/2, silver 1/2/3, gold 2/3/4 for basic_economy/economy/business, keyed by task_state.membership x the reservation's cabin) recorded in search_scratch by the reservation read; the reported number MUST be the calculate result of '<allowance_per_pax> * <passenger count>' and go into comm_note. If the calculate result does not equal allowance_per_pax times the passenger count recorded in search_scratch, set NOTHING and do not advance (the expression was wrong and must be re-run).",
+      "'Upcoming' means every reservation of the profile with NO flight date < '2024-05-15', INCLUDING reservations this session is about to cancel and regardless of a 'cancelled' status; EXCLUDE any reservation with a flown segment."
+    ],
+    "patch_ops_policy": {
+      "allowed": [
+        {
+          "op": "set",
+          "path": "task_state.comm_note"
+        },
+        {
+          "op": "set",
+          "path": "task_state.resolved"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_action"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_queue"
+        },
+        {
+          "op": "set",
+          "path": "task_state.reservation_id"
+        },
+        {
+          "op": "set",
+          "path": "task_state.txn_details"
+        },
+        {
+          "op": "set",
+          "path": "task_state.cancel_reason"
+        },
+        {
+          "op": "set",
+          "path": "task_state.res_cabin"
+        },
+        {
+          "op": "set",
+          "path": "task_state.candidate_res_ids"
+        },
+        {
+          "op": "set",
+          "path": "task_state.search_scratch"
+        }
+      ]
+    },
+    "done_when_all": [
+      "task_state.resolved == true or task_state.txn_action != 'comm'"
+    ],
+    "sys_output_format": "{ \"patch_ops\": [ {\"op\":\"set\",\"path\":\"task_state.comm_note\",\"value\":\"your gift cards total 327\"}, {\"op\":\"set\",\"path\":\"task_state.txn_action\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.txn_queue\",\"value\":null}, {\"op\":\"set\",\"path\":\"task_state.resolved\",\"value\":true} ] }"
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "__about__": "SchemaFlex schema for tau2 RETAIL (solo, 8B workhorse + sparse gpt-5.4 HILO on load-bearing extractions). v3: MULTI-TRANSACTION + CONDITIONAL. The request is parsed into a transaction QUEUE (PLAN_TXNS); POP_TARGET loads one transaction's action+order into the working registers; the LOAD->resolve->DO flow executes it; each DO advances to the next transaction (or sets resolved on the last). SKIP_TARGET drops a queued transaction whose precondition is unmet (e.g. cancel a non-pending order) so 'cancel all pending' works. The item walk (PLAN_CHANGES/WALK_VARIANT) handles multi-item; a conditional fallback in the walk switches a change to a cancel when no variant is available.",
+  "__conventions__": "Parenthesis-free DNF predicates. Every transaction subtask is prefixed 'task_state.resolved == false'. Working registers (requested_action/order_id/order_status/item_ids/new_item_ids/change_plan/cancel_reason/new_address*) hold the CURRENT transaction; POP_TARGET sets them and clears the per-order ones. Fields the initializer must NOT fabricate are typed '<type>|null'.",
+  "retail": {
+    "goal_template": "complete all of the customer's retail requests: <goal>",
+    "success_when_all": [
+      "task_state.resolved == true"
+    ],
+    "task_state_schema": {
+      "fields": {
+        "goal": "string (full restatement of reason_for_call, including every requested action)",
+        "customer_first": "string|null (first name from known_info; for name+zip auth)",
+        "customer_last": "string|null (last name from known_info)",
+        "customer_zip": "string|null (zip from known_info)",
+        "customer_email": "string|null (email ONLY if the scenario states one; if unknown/forgotten, null)",
+        "user_id": "string|null (set by AUTH)",
+        "tried_email": "bool|null (set true by AUTH after an email lookup attempt)",
+        "tried_name": "bool|null (set true by AUTH after a name+zip lookup attempt)",
+        "user_loaded": "bool|null (set true by GET_USER)",
+        "candidate_order_ids": "list|null (JSON array of the customer's order ids; set by GET_USER)",
+        "txn_queue": "string|null (JSON array of the transactions to perform, each {\"action\":..., \"order_id\":...|null, \"details\":...}; set by PLAN_TXNS, consumed head-first by POP_TARGET; when the last is popped it becomes null)",
+        "requested_action": "string|null (the CURRENT transaction's action: 'cancel'|'modify_address'|'modify_payment'|'modify_user_address'|'modify_items'|'exchange'|'return'; set by POP_TARGET)",
+        "txn_details": "string|null (the current transaction's free-text details from the plan: which items / new options / new address / reason; set by POP_TARGET)",
+        "order_id": "string|null (the current transaction's order id; set by POP_TARGET or by LOAD_ORDER discovery)",
+        "cancel_reason": "string|null ('no longer needed' or 'ordered by mistake') for a cancel",
+        "new_address1": "string|null", "new_address2": "string|null", "new_city": "string|null", "new_state": "string|null", "new_country": "string|null", "new_zip": "string|null",
+        "payment_method_id": "string|null (payment method for a difference/refund; default = the order's original, set by LOAD_ORDER)",
+        "order_status": "string|null (current order status; set by LOAD_ORDER; CLEARED by POP_TARGET)",
+        "order_items": "string|null (JSON array of the current order's items {item_id,product_id,name,options}; set by LOAD_ORDER; cleared by POP_TARGET)",
+        "change_plan": "string|null (JSON array of items to exchange/modify {old_item_id,product_id,desired_options}; set by PLAN_CHANGES, consumed by WALK_VARIANT; cleared by POP_TARGET)",
+        "item_ids": "string|null (JSON array of order item_ids being changed/returned; built by WALK_VARIANT / RESOLVE_RETURN_ITEMS; cleared by POP_TARGET)",
+        "new_item_ids": "string|null (JSON array of replacement item_ids, position-matched; built by WALK_VARIANT; cleared by POP_TARGET)",
+        "resolved": "bool (true ONLY when the LAST transaction succeeded and the queue is empty)",
+        "escalated": "bool (true once transferred to a human)"
+      },
+      "enums": {
+        "order_status": ["pending", "processed", "delivered", "cancelled", "return requested", "exchange requested", "pending (item modified)"]
+      }
+    },
+    "init_rules": [
+      "goal: restate reason_for_call IN FULL, keeping every distinct request (the planner reads this).",
+      "customer_first, customer_last, customer_zip: from known_info (e.g. 'You are Yusuf Rossi in zip 19122' -> first='Yusuf', last='Rossi', zip='19122'). An id-style handle 'mei_kovacs_8020' -> first='mei', last='kovacs' (parts before the trailing number).",
+      "customer_email: set ONLY if the scenario explicitly gives an email; if it says unknown/forgotten, null.",
+      "Do NOT set txn_queue, requested_action, order_id or any transaction register at init — the planner (PLAN_TXNS) builds them from real order data.",
+      "resolved := false; escalated := false."
+    ],
+    "base_subtask_sequence": [
+      { "name": "auth", "subtask_type": "AUTH", "when": "task_state.user_id == null and task_state.tried_email != true or task_state.user_id == null and task_state.tried_name != true", "expects": [], "produces": [] },
+      { "name": "getUser", "subtask_type": "GET_USER", "when": "task_state.resolved == false and task_state.user_id != null and task_state.user_loaded == null", "expects": [], "produces": [] },
+      { "name": "planTxns", "subtask_type": "PLAN_TXNS", "when": "task_state.resolved == false and task_state.user_loaded == true and task_state.txn_queue == null and task_state.requested_action == null", "expects": [], "produces": [] },
+      { "name": "popTarget", "subtask_type": "POP_TARGET", "when": "task_state.resolved == false and task_state.requested_action == null and task_state.txn_queue != null", "expects": [], "produces": [] },
+      { "name": "loadOrder", "subtask_type": "LOAD_ORDER", "when": "task_state.resolved == false and task_state.requested_action != null and task_state.requested_action != 'modify_user_address' and task_state.order_id != null and task_state.order_status == null", "expects": [], "produces": [] },
+      { "name": "skipCancel", "subtask_type": "SKIP_TARGET", "when": "task_state.resolved == false and task_state.requested_action == 'cancel' and task_state.order_status != null and task_state.order_status != 'pending'", "expects": [], "produces": [] },
+      { "name": "skipModify", "subtask_type": "SKIP_TARGET", "when": "task_state.resolved == false and task_state.requested_action == 'modify_address' and task_state.order_status != null and task_state.order_status != 'pending' or task_state.resolved == false and task_state.requested_action == 'modify_payment' and task_state.order_status != null and task_state.order_status != 'pending' or task_state.resolved == false and task_state.requested_action == 'modify_items' and task_state.order_status != null and task_state.order_status != 'pending'", "expects": [], "produces": [] },
+      { "name": "skipDeliv", "subtask_type": "SKIP_TARGET", "when": "task_state.resolved == false and task_state.requested_action == 'exchange' and task_state.order_status != null and task_state.order_status != 'delivered' or task_state.resolved == false and task_state.requested_action == 'return' and task_state.order_status != null and task_state.order_status != 'delivered'", "expects": [], "produces": [] },
+      { "name": "planChanges", "subtask_type": "PLAN_CHANGES", "when": "task_state.resolved == false and task_state.change_plan == null and task_state.new_item_ids == null and task_state.order_status == 'pending' and task_state.requested_action == 'modify_items' or task_state.resolved == false and task_state.change_plan == null and task_state.new_item_ids == null and task_state.order_status == 'delivered' and task_state.requested_action == 'exchange'", "expects": [], "produces": [] },
+      { "name": "walkVariant", "subtask_type": "WALK_VARIANT", "when": "task_state.resolved == false and task_state.change_plan != null", "expects": [], "produces": [] },
+      { "name": "resolveReturnItems", "subtask_type": "RESOLVE_RETURN_ITEMS", "when": "task_state.resolved == false and task_state.requested_action == 'return' and task_state.order_status == 'delivered' and task_state.item_ids == null", "expects": [], "produces": [] },
+      { "name": "doCancel", "subtask_type": "DO_CANCEL", "when": "task_state.resolved == false and task_state.requested_action == 'cancel' and task_state.order_status == 'pending'", "expects": [], "produces": [] },
+      { "name": "doModifyAddress", "subtask_type": "DO_MODIFY_ADDRESS", "when": "task_state.resolved == false and task_state.requested_action == 'modify_address' and task_state.order_status == 'pending'", "expects": [], "produces": [] },
+      { "name": "doModifyPayment", "subtask_type": "DO_MODIFY_PAYMENT", "when": "task_state.resolved == false and task_state.requested_action == 'modify_payment' and task_state.order_status == 'pending'", "expects": [], "produces": [] },
+      { "name": "doModifyUserAddress", "subtask_type": "DO_MODIFY_USER_ADDRESS", "when": "task_state.resolved == false and task_state.requested_action == 'modify_user_address' and task_state.user_id != null", "expects": [], "produces": [] },
+      { "name": "doReturn", "subtask_type": "DO_RETURN", "when": "task_state.resolved == false and task_state.requested_action == 'return' and task_state.order_status == 'delivered' and task_state.item_ids != null", "expects": [], "produces": [] },
+      { "name": "doExchange", "subtask_type": "DO_EXCHANGE", "when": "task_state.resolved == false and task_state.requested_action == 'exchange' and task_state.order_status == 'delivered' and task_state.change_plan == null and task_state.new_item_ids != null", "expects": [], "produces": [] },
+      { "name": "doModifyItems", "subtask_type": "DO_MODIFY_ITEMS", "when": "task_state.resolved == false and task_state.requested_action == 'modify_items' and task_state.order_status == 'pending' and task_state.change_plan == null and task_state.new_item_ids != null", "expects": [], "produces": [] },
+      { "name": "finalize", "subtask_type": "FINALIZE", "when": "task_state.resolved == false and task_state.txn_queue == null and task_state.requested_action == null and task_state.user_loaded == true", "expects": [], "produces": [] },
+      { "name": "escalate", "subtask_type": "ESCALATE", "when": "task_state.resolved == false and task_state.escalated != true", "expects": [], "produces": [] }
+    ]
+  }
+}

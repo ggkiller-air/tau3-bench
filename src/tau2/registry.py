@@ -14,9 +14,27 @@ from tau2.agent.llm_agent import (
     create_llm_gt_agent,
     create_llm_solo_agent,
 )
+from tau2.agent.llm_hiagent import (
+    create_llm_hiagent,
+)
+from tau2.agent.llm_react_agent import (
+    create_llm_react_agent,
+)
 from tau2.agent.schema_agent import (
     create_llm_solo_agent_sanitized,
     create_schema_solo_agent,
+)
+from tau2.agent.llm_solo_std_agent import (
+    LLMSoloStdAgent,
+    create_llm_solo_std_agent,
+)
+from tau2.agent.llm_std_flex_agent import (
+    LLMStdFlexAgent,
+    create_llm_std_flex_agent,
+)
+from tau2.agent.schema_solo_std_agent import (
+    SchemaSoloStdAgent,
+    create_schema_solo_std_agent,
 )
 from tau2.agent.schema_user_agent import (
     SchemaUserAgent,
@@ -306,6 +324,8 @@ try:
 
     # Agent factories
     registry.register_agent_factory(create_llm_agent, "llm_agent")
+    registry.register_agent_factory(create_llm_react_agent, "llm_agent_react")
+    registry.register_agent_factory(create_llm_hiagent, "llm_agent_hiagent")
     registry.register_agent_factory(
         create_llm_gt_agent,
         "llm_agent_gt",
@@ -324,10 +344,26 @@ try:
         metadata={"solo_mode": True},
     )
     registry.register_agent_factory(
+        create_schema_solo_std_agent,
+        "schema_solo_std_agent",
+        task_filter=SchemaSoloStdAgent.check_valid_task,
+        metadata={"solo_mode": True},
+    )
+    registry.register_agent_factory(
         create_llm_solo_agent_sanitized,
         "llm_agent_solo_sanitized",
         task_filter=LLMSoloAgent.check_valid_task,
         metadata={"solo_mode": True},
+    )
+    registry.register_agent_factory(
+        create_llm_solo_std_agent,
+        "llm_agent_solo_std",
+        task_filter=LLMSoloStdAgent.check_valid_task,
+        metadata={"solo_mode": True},
+    )
+    registry.register_agent_factory(
+        create_llm_std_flex_agent,
+        "llm_agent_std_flex",
     )
     registry.register_agent_factory(
         create_schema_user_agent,

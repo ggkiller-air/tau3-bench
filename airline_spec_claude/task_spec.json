@@ -1,0 +1,776 @@
+{
+  "__about__": "SchemaFlex schema for tau2 AIRLINE (solo-standard mode, schema_solo_std_agent, run with --max-steps 60 — one tool call costs 2 orchestrator steps and multi-reservation tasks need ~21 calls, so 30 is NOT enough). Single family 'airline' (airline task ids carry no [prefix], so the agent falls back to the FIRST top-level key — keep 'airline' the only family). Design: GET_PLAN folds user-read + transaction planning + first-pop into ONE call; every DO_*/DENY_TXN/COMM parse carries its own ADVANCE (queue pop) so no calculate-only POP step is wasted; all policy vetos (cancel eligibility, basic-economy flight lock, flown cabin lock, bag removal, request scope, budget conditions, categorical denials) are DETERMINISTIC sequence-when gates over parsed facts — the 8B never judges legality at execution time, and a write tool is simply unreachable when its gate is false. send_certificate appears in NO subtask (ground truth never issues one), so compensation denials are structural. KNOWN GT CONFLICT (insurance cancels): task 39 annotates an insured change-of-plan cancel as eligible while tasks 44/47 annotate the policy-strict reading; the discriminator in the data is the user EXPLICITLY accepting a no-refund cancellation, encoded as no_refund_ok — the doCancel gate is insurance AND health/weather OR insurance AND no_refund_ok==true. Do NOT loosen it to insurance alone (that flips 44/47).",
+  "__conventions__": "Parenthesis-free DNF predicates (' and '/' or ' with spaces, no parens, no not). Every entry is prefixed 'task_state.resolved == false'. null fails == comparisons against true/false/strings, so every gate is anchored on at least one field that LOAD_RES/GET_PLAN must set explicitly — an unparsed fact stalls the walk into a clean STOP with the DB untouched (deny tasks still pass). res_cabin doubles as the 'facts loaded' sentinel: every ADVANCE sets res_cabin=null, and the LOAD_RES entries sit ABOVE all gates so fresh facts are always read before any write gate can fire. Duplicate entries (loadRes1..6, doCancel1..3, ...) exist because a named entry is marked done forever after its first completion; duplicates serve successive transactions of the queue, and each duplicate's on_enter_reset re-nulls the per-reservation registers. reservation_id carries the sentinel string 'NONE' when FIND_RES exhausts all candidates — denyNotFound refuses that transaction and every loadRes gate excludes it. all_res_ids is the pristine reservation list: every ADVANCE restores candidate_res_ids from it so a later description-matched transaction can search the FULL profile again. in_scope is the request-scope veto (user's selection criterion, e.g. 'only single-passenger reservations'): LOAD_RES ALWAYS sets it for cancel/update transactions and every write gate requires in_scope == true; denyOutOfScope refuses non-matching reservations. Gates that read per-reservation facts are all anchored on res_cabin != null so exhausted loadRes duplicates fail closed instead of evaluating the PREVIOUS reservation's stale facts.",
+  "airline": {
+    "goal_template": "complete all of the customer's airline requests: <goal>",
+    "success_when_all": [
+      "task_state.resolved == true"
+    ],
+    "task_state_schema": {
+      "fields": {
+        "goal": "string (FULL restatement of the user's request, keeping every distinct ask, condition and budget)",
+        "user_id": "string (the user id given verbatim in the request, e.g. 'emma_kim_9957')",
+        "user_loaded": "bool|null (set by GET_PLAN)",
+        "membership": "string|null (set by GET_PLAN from the profile: regular/silver/gold — NEVER from the user's claim)",
+        "pay_methods": "object|null (set by GET_PLAN: JSON object payment_id -> {source, amount, last_four})",
+        "saved_passengers": "list|null (set by GET_PLAN: [{first_name,last_name,dob}] from the profile)",
+        "candidate_res_ids": "list|null (set by GET_PLAN: the profile's reservation ids; consumed head-first by FIND_RES)",
+        "txn_queue": "list|null (set by GET_PLAN: REMAINING transactions [{action,reservation_id,details,reason}]; consumed by each DO_*/DENY_TXN ADVANCE)",
+        "txn_action": "string|null (set by GET_PLAN then by each ADVANCE: the CURRENT transaction's action — EXACTLY one of 'book'/'cancel'/'update_flights'/'update_passengers'/'update_baggages'/'deny'/'transfer'/'comm'; any other string matches no gate and stalls the walk)",
+        "txn_details": "string|null (set by GET_PLAN then by each ADVANCE: verbatim constraints of the current transaction)",
+        "reservation_id": "string|null (set by GET_PLAN / ADVANCE / FIND_RES: the current transaction's reservation; the literal string 'NONE' when FIND_RES exhausted every candidate without a match)",
+        "cancel_reason": "string|null (set by GET_PLAN / ADVANCE: reason for a cancel transaction — EXACTLY one of 'change_of_plan'/'airline_cancelled'/'health'/'weather'/'other')",
+        "res_cabin": "string|null (set by LOAD_RES; null = current reservation facts NOT loaded yet — every ADVANCE nulls it)",
+        "res_insurance": "string|null (set by LOAD_RES: 'yes'/'no' verbatim)",
+        "res_flights": "list|null (set by LOAD_RES: [{flight_number,date,origin,destination,price}])",
+        "res_passengers": "list|null (set by LOAD_RES: passengers verbatim)",
+        "booked_within_24h": "bool|null (set by LOAD_RES: created_at >= '2024-05-14T15:00:00')",
+        "any_flown": "bool|null (set by LOAD_RES: any flight date < '2024-05-15'; for a cancel with only same-day 2024-05-15 segments LOAD_RES leaves it null and CHECK_FLOWN decides true/false)",
+        "flight_cancelled": "bool|null (set by CHECK_FSTAT — and by CHECK_FLOWN for a same-day cancelled segment — from get_flight_status: true only when a segment's REAL status is 'cancelled')",
+        "check_flights": "list|null (set by LOAD_RES for cancel transactions — the same-day segments first when the flown check is needed, else all segments; consumed head-first by CHECK_FLOWN / CHECK_FSTAT)",
+        "flights_changed": "bool|null (set by LOAD_RES: does this update replace/move any flight segment?)",
+        "cabin_changed": "bool|null (set by LOAD_RES: does this update change the cabin class?)",
+        "new_flights": "list|null (set by LOAD_RES cabin-only, CHECK_UPCOST, or SEARCH_UPDATE: the COMPLETE new flight list [{flight_number,date,origin,destination}] — the env ignores the extra keys; the runner guard validates them)",
+        "new_cabin": "string|null (set by LOAD_RES: target cabin, = res_cabin when unchanged)",
+        "update_payment_id": "string|null (set by LOAD_RES: a gift_card_*/credit_card_* id, NEVER certificate)",
+        "update_abandoned": "bool|null (set by SEARCH_UPDATE when a budget/feasibility condition fails: do NOTHING)",
+        "new_total_baggages": "int|null (set by LOAD_RES: NEW total, old + added)",
+        "new_nonfree_baggages": "int|null (set by LOAD_RES: max(0, new total - free allowance))",
+        "bags_ok": "bool|null (set by LOAD_RES: false when the request would remove bags)",
+        "new_passengers": "list|null (set by LOAD_RES: COMPLETE passenger list, same length, co-passengers preserved)",
+        "book_ref": "string|null (set by GET_PLAN when a booking copies an existing reservation; consumed by LOAD_REF)",
+        "book_origin": "string|null (set by GET_PLAN/SEARCH_BOOK/LOAD_REF: IATA code)",
+        "book_destination": "string|null (set by GET_PLAN/SEARCH_BOOK/LOAD_REF: IATA code)",
+        "book_flight_type": "string|null (set by GET_PLAN/SEARCH_BOOK/LOAD_REF)",
+        "book_cabin": "string|null (set by GET_PLAN/SEARCH_BOOK/LOAD_REF/PLAN_BOOK)",
+        "book_insurance": "string|null (set by GET_PLAN/PLAN_BOOK: 'yes' only if explicitly requested)",
+        "book_flights": "list|null (set by SEARCH_BOOK/LOAD_REF: [{flight_number,date}] in trip order)",
+        "book_price_expr": "string|null (set by SEARCH_BOOK/LOAD_REF: arithmetic expression for the total, e.g. '(142+263)*2+30*2+50*0')",
+        "book_total": "number|null (set by PLAN_BOOK from the calculate result, corrected by DO_BOOK on env error)",
+        "book_total_baggages": "int|null (set by PLAN_BOOK)",
+        "book_nonfree_baggages": "int|null (set by PLAN_BOOK)",
+        "book_passengers": "list|null (set by PLAN_BOOK/LOAD_REF: [{first_name,last_name,dob}])",
+        "book_payment": "list|null (set by PLAN_BOOK: [{payment_id,amount}] summing exactly to the total)",
+        "search_scratch": "string|null (set by SEARCH_*: legs/options found so far during a multi-search)",
+        "write_landed": "bool|null (set by DO_* when the write tool succeeded; retest_guard then blocks a second write)",
+        "resolved": "bool (true ONLY when every queued transaction was executed or correctly refused)",
+        "escalated": "bool (true once transferred to a human)",
+        "all_res_ids": "list|null (set by GET_PLAN: pristine copy of the profile's reservation ids; NEVER consumed — every ADVANCE restores candidate_res_ids from it)",
+        "in_scope": "bool|null (set by LOAD_RES for EVERY cancel/update transaction: does THIS reservation match the selection criterion stated in txn_details — passenger count, route, dates, duplicates; true when no criterion is stated)",
+        "no_refund_ok": "bool|null (set by GET_PLAN: true ONLY when the request explicitly says to proceed with the cancellation even without a refund)",
+        "price_check_needed": "bool|null (set by LOAD_RES when a cabin-only change is conditional on a budget; consumed by CHECK_UPCOST)",
+        "res_origin": "string|null (set by LOAD_RES: the reservation's 'origin' IATA code verbatim)",
+        "res_destination": "string|null (set by LOAD_RES: the reservation's 'destination' IATA code verbatim)",
+        "res_trip_type": "string|null (set by LOAD_RES: the reservation's 'flight_type' verbatim)",
+        "res_total_baggages": "int|null (set by LOAD_RES for baggage transactions: the reservation's total_baggages verbatim)",
+        "res_nonfree_baggages": "int|null (set by LOAD_RES for baggage transactions: the reservation's nonfree_baggages verbatim)",
+        "comm_note": "string|null (set by COMM: short sentence carrying every exact figure the user asked to be told; the runner emits it as assistant text before the STOP token)"
+      },
+      "enums": {
+        "membership": [
+          "regular",
+          "silver",
+          "gold"
+        ],
+        "res_cabin": [
+          "basic_economy",
+          "economy",
+          "business"
+        ],
+        "new_cabin": [
+          "basic_economy",
+          "economy",
+          "business"
+        ],
+        "book_cabin": [
+          "basic_economy",
+          "economy",
+          "business"
+        ],
+        "res_insurance": [
+          "yes",
+          "no"
+        ],
+        "book_insurance": [
+          "yes",
+          "no"
+        ],
+        "book_flight_type": [
+          "one_way",
+          "round_trip"
+        ],
+        "res_trip_type": [
+          "one_way",
+          "round_trip"
+        ],
+        "cancel_reason": [
+          "change_of_plan",
+          "airline_cancelled",
+          "health",
+          "weather",
+          "other"
+        ]
+      }
+    },
+    "init_rules": [
+      "goal: restate the user's request IN FULL — every distinct ask (bookings, flight/cabin/date changes, passenger fixes, baggage adds, cancellations, compensation asks), every condition and budget. The planner reads this.",
+      "user_id: the user id given verbatim in the request (format like 'emma_kim_9957').",
+      "resolved := false; escalated := false.",
+      "Do NOT set any other field — every field typed '|null' is produced later by its named subtask, never at init. Never infer reservation facts, membership, or payment ids from the request text."
+    ],
+    "base_subtask_sequence": [
+      {
+        "name": "getPlan",
+        "subtask_type": "GET_PLAN",
+        "when": "task_state.resolved == false and task_state.user_loaded != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "comm1",
+        "subtask_type": "COMM",
+        "when": "task_state.resolved == false and task_state.txn_action == 'comm'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "comm2",
+        "subtask_type": "COMM",
+        "when": "task_state.resolved == false and task_state.txn_action == 'comm'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "comm3",
+        "subtask_type": "COMM",
+        "when": "task_state.resolved == false and task_state.txn_action == 'comm'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "comm4",
+        "subtask_type": "COMM",
+        "when": "task_state.resolved == false and task_state.txn_action == 'comm'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyNotFound1",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.reservation_id == 'NONE'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyNotFound2",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.reservation_id == 'NONE'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "findRes1",
+        "subtask_type": "FIND_RES",
+        "when": "task_state.resolved == false and task_state.reservation_id == null and task_state.candidate_res_ids != null and task_state.txn_action == 'cancel' or task_state.resolved == false and task_state.reservation_id == null and task_state.candidate_res_ids != null and task_state.txn_action == 'update_flights' or task_state.resolved == false and task_state.reservation_id == null and task_state.candidate_res_ids != null and task_state.txn_action == 'update_passengers' or task_state.resolved == false and task_state.reservation_id == null and task_state.candidate_res_ids != null and task_state.txn_action == 'update_baggages'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "findRes2",
+        "subtask_type": "FIND_RES",
+        "when": "task_state.resolved == false and task_state.reservation_id == null and task_state.candidate_res_ids != null and task_state.txn_action == 'cancel' or task_state.resolved == false and task_state.reservation_id == null and task_state.candidate_res_ids != null and task_state.txn_action == 'update_flights' or task_state.resolved == false and task_state.reservation_id == null and task_state.candidate_res_ids != null and task_state.txn_action == 'update_passengers' or task_state.resolved == false and task_state.reservation_id == null and task_state.candidate_res_ids != null and task_state.txn_action == 'update_baggages'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "findRes3",
+        "subtask_type": "FIND_RES",
+        "when": "task_state.resolved == false and task_state.reservation_id == null and task_state.candidate_res_ids != null and task_state.txn_action == 'cancel' or task_state.resolved == false and task_state.reservation_id == null and task_state.candidate_res_ids != null and task_state.txn_action == 'update_flights' or task_state.resolved == false and task_state.reservation_id == null and task_state.candidate_res_ids != null and task_state.txn_action == 'update_passengers' or task_state.resolved == false and task_state.reservation_id == null and task_state.candidate_res_ids != null and task_state.txn_action == 'update_baggages'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "findRes4",
+        "subtask_type": "FIND_RES",
+        "when": "task_state.resolved == false and task_state.reservation_id == null and task_state.candidate_res_ids != null and task_state.txn_action == 'cancel' or task_state.resolved == false and task_state.reservation_id == null and task_state.candidate_res_ids != null and task_state.txn_action == 'update_flights' or task_state.resolved == false and task_state.reservation_id == null and task_state.candidate_res_ids != null and task_state.txn_action == 'update_passengers' or task_state.resolved == false and task_state.reservation_id == null and task_state.candidate_res_ids != null and task_state.txn_action == 'update_baggages'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "loadRes1",
+        "subtask_type": "LOAD_RES",
+        "when": "task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'cancel' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_flights' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_passengers' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_baggages'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "loadRes2",
+        "subtask_type": "LOAD_RES",
+        "when": "task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'cancel' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_flights' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_passengers' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_baggages'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "loadRes3",
+        "subtask_type": "LOAD_RES",
+        "when": "task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'cancel' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_flights' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_passengers' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_baggages'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "loadRes4",
+        "subtask_type": "LOAD_RES",
+        "when": "task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'cancel' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_flights' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_passengers' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_baggages'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "loadRes5",
+        "subtask_type": "LOAD_RES",
+        "when": "task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'cancel' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_flights' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_passengers' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_baggages'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "loadRes6",
+        "subtask_type": "LOAD_RES",
+        "when": "task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'cancel' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_flights' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_passengers' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_baggages'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "loadRes7",
+        "subtask_type": "LOAD_RES",
+        "when": "task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'cancel' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_flights' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_passengers' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_baggages'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "loadRes8",
+        "subtask_type": "LOAD_RES",
+        "when": "task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'cancel' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_flights' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_passengers' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_baggages'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "loadRes9",
+        "subtask_type": "LOAD_RES",
+        "when": "task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'cancel' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_flights' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_passengers' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_baggages'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "loadRes10",
+        "subtask_type": "LOAD_RES",
+        "when": "task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'cancel' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_flights' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_passengers' or task_state.resolved == false and task_state.reservation_id != null and task_state.reservation_id != 'NONE' and task_state.res_cabin == null and task_state.txn_action == 'update_baggages'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyOutOfScope1",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.res_cabin != null and task_state.in_scope == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyOutOfScope2",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.res_cabin != null and task_state.in_scope == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyOutOfScope3",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.res_cabin != null and task_state.in_scope == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyOutOfScope4",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.res_cabin != null and task_state.in_scope == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyOutOfScope5",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.res_cabin != null and task_state.in_scope == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyOutOfScope6",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.res_cabin != null and task_state.in_scope == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyPlanned1",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'deny'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyPlanned2",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'deny'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyPlanned3",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'deny'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyPlanned4",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'deny'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkFlown1",
+        "subtask_type": "CHECK_FLOWN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == null and task_state.check_flights != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkFlown2",
+        "subtask_type": "CHECK_FLOWN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == null and task_state.check_flights != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkFlown3",
+        "subtask_type": "CHECK_FLOWN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == null and task_state.check_flights != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkFlown4",
+        "subtask_type": "CHECK_FLOWN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == null and task_state.check_flights != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyCancelFlown1",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.any_flown == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyCancelFlown2",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.any_flown == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyCancelFlown3",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.any_flown == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doCancel1",
+        "subtask_type": "DO_CANCEL",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.booked_within_24h == true or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.res_cabin == 'business' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.res_insurance == 'yes' and task_state.cancel_reason == 'health' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.res_insurance == 'yes' and task_state.cancel_reason == 'weather' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.res_insurance == 'yes' and task_state.no_refund_ok == true or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.flight_cancelled == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doCancel2",
+        "subtask_type": "DO_CANCEL",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.booked_within_24h == true or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.res_cabin == 'business' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.res_insurance == 'yes' and task_state.cancel_reason == 'health' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.res_insurance == 'yes' and task_state.cancel_reason == 'weather' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.res_insurance == 'yes' and task_state.no_refund_ok == true or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.flight_cancelled == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doCancel3",
+        "subtask_type": "DO_CANCEL",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.booked_within_24h == true or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.res_cabin == 'business' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.res_insurance == 'yes' and task_state.cancel_reason == 'health' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.res_insurance == 'yes' and task_state.cancel_reason == 'weather' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.res_insurance == 'yes' and task_state.no_refund_ok == true or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.flight_cancelled == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doCancel4",
+        "subtask_type": "DO_CANCEL",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.booked_within_24h == true or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.res_cabin == 'business' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.res_insurance == 'yes' and task_state.cancel_reason == 'health' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.res_insurance == 'yes' and task_state.cancel_reason == 'weather' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.res_insurance == 'yes' and task_state.no_refund_ok == true or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.flight_cancelled == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkFstat1",
+        "subtask_type": "CHECK_FSTAT",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.flight_cancelled == null and task_state.check_flights != null and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.res_insurance == 'no' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.flight_cancelled == null and task_state.check_flights != null and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.cancel_reason != 'health' and task_state.cancel_reason != 'weather' and task_state.no_refund_ok != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkFstat2",
+        "subtask_type": "CHECK_FSTAT",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.flight_cancelled == null and task_state.check_flights != null and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.res_insurance == 'no' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.flight_cancelled == null and task_state.check_flights != null and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.cancel_reason != 'health' and task_state.cancel_reason != 'weather' and task_state.no_refund_ok != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkFstat3",
+        "subtask_type": "CHECK_FSTAT",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.flight_cancelled == null and task_state.check_flights != null and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.res_insurance == 'no' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.flight_cancelled == null and task_state.check_flights != null and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.cancel_reason != 'health' and task_state.cancel_reason != 'weather' and task_state.no_refund_ok != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkFstat4",
+        "subtask_type": "CHECK_FSTAT",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.flight_cancelled == null and task_state.check_flights != null and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.res_insurance == 'no' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.flight_cancelled == null and task_state.check_flights != null and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.cancel_reason != 'health' and task_state.cancel_reason != 'weather' and task_state.no_refund_ok != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkFstat5",
+        "subtask_type": "CHECK_FSTAT",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.flight_cancelled == null and task_state.check_flights != null and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.res_insurance == 'no' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.flight_cancelled == null and task_state.check_flights != null and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.cancel_reason != 'health' and task_state.cancel_reason != 'weather' and task_state.no_refund_ok != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkFstat6",
+        "subtask_type": "CHECK_FSTAT",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.flight_cancelled == null and task_state.check_flights != null and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.res_insurance == 'no' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.flight_cancelled == null and task_state.check_flights != null and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.cancel_reason != 'health' and task_state.cancel_reason != 'weather' and task_state.no_refund_ok != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyCancelInelig1",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.flight_cancelled == false and task_state.res_insurance == 'no' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.flight_cancelled == false and task_state.res_insurance == 'yes' and task_state.cancel_reason != 'health' and task_state.cancel_reason != 'weather' and task_state.no_refund_ok != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyCancelInelig2",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.flight_cancelled == false and task_state.res_insurance == 'no' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.flight_cancelled == false and task_state.res_insurance == 'yes' and task_state.cancel_reason != 'health' and task_state.cancel_reason != 'weather' and task_state.no_refund_ok != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyCancelInelig3",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.flight_cancelled == false and task_state.res_insurance == 'no' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.flight_cancelled == false and task_state.res_insurance == 'yes' and task_state.cancel_reason != 'health' and task_state.cancel_reason != 'weather' and task_state.no_refund_ok != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyCancelInelig4",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.flight_cancelled == false and task_state.res_insurance == 'no' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.flight_cancelled == false and task_state.res_insurance == 'yes' and task_state.cancel_reason != 'health' and task_state.cancel_reason != 'weather' and task_state.no_refund_ok != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyCancelInelig5",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.flight_cancelled == false and task_state.res_insurance == 'no' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.flight_cancelled == false and task_state.res_insurance == 'yes' and task_state.cancel_reason != 'health' and task_state.cancel_reason != 'weather' and task_state.no_refund_ok != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyCancelInelig6",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.flight_cancelled == false and task_state.res_insurance == 'no' or task_state.resolved == false and task_state.txn_action == 'cancel' and task_state.res_cabin != null and task_state.in_scope == true and task_state.any_flown == false and task_state.booked_within_24h == false and task_state.res_cabin != 'business' and task_state.flight_cancelled == false and task_state.res_insurance == 'yes' and task_state.cancel_reason != 'health' and task_state.cancel_reason != 'weather' and task_state.no_refund_ok != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyUpdateBE1",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin == 'basic_economy' and task_state.flights_changed == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyUpdateBE2",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin == 'basic_economy' and task_state.flights_changed == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyUpdateFlown1",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.cabin_changed == true and task_state.any_flown == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkUpcost1",
+        "subtask_type": "CHECK_UPCOST",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.price_check_needed == true and task_state.update_abandoned == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkUpcost2",
+        "subtask_type": "CHECK_UPCOST",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.price_check_needed == true and task_state.update_abandoned == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyAbandon1",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.update_abandoned == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyAbandon2",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.update_abandoned == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "searchUpdate1",
+        "subtask_type": "SEARCH_UPDATE",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.flights_changed == true and task_state.new_flights == null and task_state.res_cabin != 'basic_economy' and task_state.update_abandoned != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "searchUpdate2",
+        "subtask_type": "SEARCH_UPDATE",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.flights_changed == true and task_state.new_flights == null and task_state.res_cabin != 'basic_economy' and task_state.update_abandoned != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "searchUpdate3",
+        "subtask_type": "SEARCH_UPDATE",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.flights_changed == true and task_state.new_flights == null and task_state.res_cabin != 'basic_economy' and task_state.update_abandoned != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "searchUpdate4",
+        "subtask_type": "SEARCH_UPDATE",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.flights_changed == true and task_state.new_flights == null and task_state.res_cabin != 'basic_economy' and task_state.update_abandoned != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "searchUpdate5",
+        "subtask_type": "SEARCH_UPDATE",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.flights_changed == true and task_state.new_flights == null and task_state.res_cabin != 'basic_economy' and task_state.update_abandoned != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "searchUpdate6",
+        "subtask_type": "SEARCH_UPDATE",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.flights_changed == true and task_state.new_flights == null and task_state.res_cabin != 'basic_economy' and task_state.update_abandoned != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doUpdateFlights1",
+        "subtask_type": "DO_UPDATE_FLIGHTS",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.flights_changed == false and task_state.cabin_changed == false or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.flights_changed == false and task_state.any_flown == false or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.res_cabin != 'basic_economy' and task_state.cabin_changed == false and task_state.flights_changed == true or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.res_cabin != 'basic_economy' and task_state.any_flown == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doUpdateFlights2",
+        "subtask_type": "DO_UPDATE_FLIGHTS",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.flights_changed == false and task_state.cabin_changed == false or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.flights_changed == false and task_state.any_flown == false or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.res_cabin != 'basic_economy' and task_state.cabin_changed == false and task_state.flights_changed == true or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.res_cabin != 'basic_economy' and task_state.any_flown == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doUpdateFlights3",
+        "subtask_type": "DO_UPDATE_FLIGHTS",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.flights_changed == false and task_state.cabin_changed == false or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.flights_changed == false and task_state.any_flown == false or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.res_cabin != 'basic_economy' and task_state.cabin_changed == false and task_state.flights_changed == true or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.res_cabin != 'basic_economy' and task_state.any_flown == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doUpdateFlights4",
+        "subtask_type": "DO_UPDATE_FLIGHTS",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.flights_changed == false and task_state.cabin_changed == false or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.flights_changed == false and task_state.any_flown == false or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.res_cabin != 'basic_economy' and task_state.cabin_changed == false and task_state.flights_changed == true or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.res_cabin != 'basic_economy' and task_state.any_flown == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doUpdateFlights5",
+        "subtask_type": "DO_UPDATE_FLIGHTS",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.flights_changed == false and task_state.cabin_changed == false or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.flights_changed == false and task_state.any_flown == false or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.res_cabin != 'basic_economy' and task_state.cabin_changed == false and task_state.flights_changed == true or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.res_cabin != 'basic_economy' and task_state.any_flown == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doUpdateFlights6",
+        "subtask_type": "DO_UPDATE_FLIGHTS",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.flights_changed == false and task_state.cabin_changed == false or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.flights_changed == false and task_state.any_flown == false or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.res_cabin != 'basic_economy' and task_state.cabin_changed == false and task_state.flights_changed == true or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.res_cabin != 'basic_economy' and task_state.any_flown == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doUpdateFlights7",
+        "subtask_type": "DO_UPDATE_FLIGHTS",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.flights_changed == false and task_state.cabin_changed == false or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.flights_changed == false and task_state.any_flown == false or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.res_cabin != 'basic_economy' and task_state.cabin_changed == false and task_state.flights_changed == true or task_state.resolved == false and task_state.txn_action == 'update_flights' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_flights != null and task_state.update_abandoned != true and task_state.price_check_needed != true and task_state.update_payment_id != null and task_state.res_cabin != 'basic_economy' and task_state.any_flown == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doUpdatePax1",
+        "subtask_type": "DO_UPDATE_PAX",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_passengers' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_passengers != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doUpdatePax2",
+        "subtask_type": "DO_UPDATE_PAX",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_passengers' and task_state.res_cabin != null and task_state.in_scope == true and task_state.new_passengers != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "denyBags1",
+        "subtask_type": "DENY_TXN",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_baggages' and task_state.bags_ok == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doUpdateBags1",
+        "subtask_type": "DO_UPDATE_BAGS",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_baggages' and task_state.res_cabin != null and task_state.in_scope == true and task_state.bags_ok == true and task_state.new_total_baggages != null and task_state.update_payment_id != null and task_state.new_nonfree_baggages != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doUpdateBags2",
+        "subtask_type": "DO_UPDATE_BAGS",
+        "when": "task_state.resolved == false and task_state.txn_action == 'update_baggages' and task_state.res_cabin != null and task_state.in_scope == true and task_state.bags_ok == true and task_state.new_total_baggages != null and task_state.update_payment_id != null and task_state.new_nonfree_baggages != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "loadRef1",
+        "subtask_type": "LOAD_REF",
+        "when": "task_state.resolved == false and task_state.txn_action == 'book' and task_state.book_ref != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "searchBook1",
+        "subtask_type": "SEARCH_BOOK",
+        "when": "task_state.resolved == false and task_state.txn_action == 'book' and task_state.book_ref == null and task_state.book_flights == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "searchBook2",
+        "subtask_type": "SEARCH_BOOK",
+        "when": "task_state.resolved == false and task_state.txn_action == 'book' and task_state.book_ref == null and task_state.book_flights == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "searchBook3",
+        "subtask_type": "SEARCH_BOOK",
+        "when": "task_state.resolved == false and task_state.txn_action == 'book' and task_state.book_ref == null and task_state.book_flights == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "planBook1",
+        "subtask_type": "PLAN_BOOK",
+        "when": "task_state.resolved == false and task_state.txn_action == 'book' and task_state.book_flights != null and task_state.book_payment == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "planBook2",
+        "subtask_type": "PLAN_BOOK",
+        "when": "task_state.resolved == false and task_state.txn_action == 'book' and task_state.book_flights != null and task_state.book_payment == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "planBook3",
+        "subtask_type": "PLAN_BOOK",
+        "when": "task_state.resolved == false and task_state.txn_action == 'book' and task_state.book_flights != null and task_state.book_payment == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doBook1",
+        "subtask_type": "DO_BOOK",
+        "when": "task_state.resolved == false and task_state.txn_action == 'book' and task_state.book_flights != null and task_state.book_payment != null and task_state.book_passengers != null and task_state.book_origin != null and task_state.book_destination != null and task_state.book_flight_type != null and task_state.book_cabin != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doBook2",
+        "subtask_type": "DO_BOOK",
+        "when": "task_state.resolved == false and task_state.txn_action == 'book' and task_state.book_flights != null and task_state.book_payment != null and task_state.book_passengers != null and task_state.book_origin != null and task_state.book_destination != null and task_state.book_flight_type != null and task_state.book_cabin != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doBook3",
+        "subtask_type": "DO_BOOK",
+        "when": "task_state.resolved == false and task_state.txn_action == 'book' and task_state.book_flights != null and task_state.book_payment != null and task_state.book_passengers != null and task_state.book_origin != null and task_state.book_destination != null and task_state.book_flight_type != null and task_state.book_cabin != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doBook4",
+        "subtask_type": "DO_BOOK",
+        "when": "task_state.resolved == false and task_state.txn_action == 'book' and task_state.book_flights != null and task_state.book_payment != null and task_state.book_passengers != null and task_state.book_origin != null and task_state.book_destination != null and task_state.book_flight_type != null and task_state.book_cabin != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doTransfer1",
+        "subtask_type": "DO_TRANSFER",
+        "when": "task_state.resolved == false and task_state.txn_action == 'transfer' and task_state.escalated != true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "finalize",
+        "subtask_type": "FINALIZE",
+        "when": "task_state.resolved == false and task_state.txn_action == null and task_state.txn_queue == null and task_state.user_loaded == true",
+        "expects": [],
+        "produces": []
+      }
+    ]
+  },
+  "__runner_notes__": [
+    "RUN with --max-steps 60 (update run_airline_schema.sh): one tool call = 2 orchestrator steps; task 39-class walks need ~21 calls.",
+    "COMM channel — NOT YET IMPLEMENTED (verified: schema_solo_std_agent.py / schema_agent.py contain no comm_note reference; _emit_done at schema_agent.py:805 emits ONLY the bare STOP token). reward_basis is ['DB','COMMUNICATE'] on all 50 tasks and 6 tasks carry communicate_info (3:'4', 7:'1628', 11:'5244', 14:'327/1000/1786', 18:'23553', 23:'327/1000/1286') — without this hook those 6 tasks are hard-capped at 0 while the walk looks healthy. MUST land before the eval round: override the resolved-branch of SchemaSoloStdAgent.generate_next_message — when task_state.resolved is true and task_state.comm_note is non-null and not yet emitted, return AssistantMessage(role='assistant', content=str(task_state['comm_note'])) ONCE (flag state.comm_emitted=True), then emit the STOP token on the NEXT step. Do NOT prepend the note to the STOP message itself (stop detection compares the token verbatim). Verify on task 3 (expects '4') before launching the batch. If the hook cannot land in time, this schema must NOT be graded on tasks 3/7/11/14/18/23.",
+    "State Pre-Guard on update_reservation_flights — NOT YET IMPLEMENTED (schema_agent.py's step loop passes executor tool args straight to the env; env tools.py:592 accepts ANY flight list without endpoint or chaining checks; GT has ~20 update_reservation_flights writes incl. one-stop->nonstop replacements). MUST land in SchemaSoloStdAgent before the eval round, before emitting the executor's call: load ts=state.task_state and verify (a) segments chain — args.flights[i].destination == args.flights[i+1].origin within the outbound (and within the return) portion, (b) args.flights[0].origin == ts['res_origin'], (c) one_way: final destination == ts['res_destination']; round_trip: the outbound reaches ts['res_destination'] and the return ends at ts['res_origin'], (d) args.flights == ts['new_flights'] VERBATIM. On violation do NOT emit the call: synthesize an env-style ToolMessage error ('Error: flight segments do not preserve the reservation origin/destination') and feed it back so DO_UPDATE_FLIGHTS' error parse rule recovers (new_flights=null -> re-search). new_flights entries carry origin/destination for exactly this check (env FlightInfo is pydantic extra=ignore, verified safe). Apply the same chaining/endpoint check to book_reservation (the chain must run book_origin -> book_destination per args) since the env writes origin/destination verbatim into the DB record.",
+    "State Pre-Guard on book_reservation — NOT YET IMPLEMENTED; MUST land before the eval round (env tools.py:187-320 checks only existence, gift/cert balance and the exact sum — payment COMPOSITION counts are never checked, so a two-certificate split would be silently written). Classify each args.payment_methods entry via ts['pay_methods'][pid]['source']; veto with an env-style error unless count(certificate)<=1, count(credit_card)<=1, count(gift_card)<=3, every pid exists in pay_methods, and each certificate/gift amount <= its stored balance. Keep the env's own sum check as the amount corrector (DO_BOOK already parses 'Payment amount does not add up' and repairs) — the guard enforces ONLY composition/balance, which the env never reports.",
+    "State Pre-Guard on update_reservation_baggages — NOT YET IMPLEMENTED; MUST land before the eval round (env writes totals verbatim and charges max(0,delta)*50 with zero validation, while bags_ok/new_total/new_nonfree come from 8B mental arithmetic in LOAD_RES). Deterministic REWRITE, not just veto: recompute allowance = {'regular':{'basic_economy':0,'economy':1,'business':2},'silver':{'basic_economy':1,'economy':2,'business':3},'gold':{'basic_economy':2,'economy':3,'business':4}}[ts['membership']][ts['res_cabin']] * len(ts['res_passengers']) in Python and FORCE args.nonfree_baggages = max(0, args.total_baggages - allowance); veto with an env-style error if args.total_baggages < ts['res_total_baggages'] or the corrected nonfree < ts['res_nonfree_baggages'] (only-add rule).",
+    "State Pre-Guard on cancel_reservation — NOT YET IMPLEMENTED; MUST land before the eval round (the doCancel gate is deterministic Python but its INPUT facts booked_within_24h/any_flown/res_cabin/res_insurance are 8B-parsed in LOAD_RES; one mis-parse opens an irreversible wrong cancel, and 11 GT tasks are pure-deny traps). Cache the raw JSON of the LAST get_reservation_details result per reservation_id; before letting cancel_reservation through, recompute IN PYTHON from that cached JSON: created_at >= '2024-05-14T15:00:00', min flight date >= '2024-05-15', cabin, insurance. Veto with an env-style error unless {within24h | cabin=='business' | insurance=='yes' and cancel_reason in ('health','weather') | insurance=='yes' and no_refund_ok==true | flight_cancelled proven via get_flight_status} holds on the RECOMPUTED facts — ignore the 8B-set booleans entirely; catching their mis-parses is this guard's whole job. Additionally: only trust a cancel_reason written by THIS transaction's ADVANCE/parse (off-enum patches are dropped and the field may retain the PREVIOUS transaction's value, e.g. a stale 'health') — if the reason was not re-written for the current reservation, treat it as 'other' (fail-closed)."
+  ]
+}

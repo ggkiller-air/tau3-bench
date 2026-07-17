@@ -537,6 +537,17 @@ class SchemaSoloAgent(LLMSoloAgent):
             kw["extra_body"] = eb
         return kw
 
+    # -- executor model hooks (high-low executor; default = small model) --- #
+
+    def _executor_model(self, subtask) -> str:
+        """LLM used for the EXECUTOR tool-call of this subtask. Default: the workhorse
+        self.llm. Subclasses may route decision-heavy subtasks to a bigger model."""
+        return self.llm
+
+    def _executor_gen_kwargs(self, subtask) -> dict:
+        """Generation kwargs for the executor call. Default: self._gen_kwargs()."""
+        return self._gen_kwargs()
+
     # -- small-model helpers ---------------------------------------------- #
 
     def _ask_json(self, system: str, user: str, call_name: str) -> Optional[dict]:
@@ -877,16 +888,19 @@ class SchemaSoloAgent(LLMSoloAgent):
                         "reason": "no_active_subtask", "task_state": dict(state.task_state)})
             return self._emit_done(state), state
 
-        # 3) Executor (small model) picks one tool call from the subtask's subset.
+        # 3) Executor picks one tool call from the subtask's subset. Model + gen-kwargs
+        #    go through hooks so a subclass can route DECISION-heavy subtasks to a bigger
+        #    model (high-low executor). Base impl returns self.llm / self._gen_kwargs()
+        #    => byte-identical to the small-model-only executor.
         tool_subset = self._tool_subset(subtask, state)
         messages = self._build_executor_messages(subtask, state, last_result_text)
         assistant_message = generate(
-            model=self.llm,
+            model=self._executor_model(subtask),
             tools=tool_subset,
             messages=messages,
             tool_choice="required",
             call_name="schema_executor",
-            **self._gen_kwargs(),
+            **self._executor_gen_kwargs(subtask),
         )
         _record_tokens(getattr(self.task, "id", "?"), "schema_executor", assistant_message)
         if not assistant_message.is_tool_call():

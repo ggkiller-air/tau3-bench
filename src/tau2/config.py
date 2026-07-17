@@ -1,3 +1,5 @@
+import os
+
 # =============================================================================
 # SIMULATION DEFAULTS (overridable via CLI)
 # =============================================================================
@@ -21,7 +23,10 @@ DEFAULT_LLM_TEMPERATURE_USER = 0.0
 DEFAULT_LLM_ARGS_AGENT = {"temperature": DEFAULT_LLM_TEMPERATURE_AGENT}
 DEFAULT_LLM_ARGS_USER = {"temperature": DEFAULT_LLM_TEMPERATURE_USER}
 
-DEFAULT_LLM_NL_ASSERTIONS = "gpt-4.1-2025-04-14"
+# Env-overridable so deployments whose proxy lacks a gpt-4.1 channel can point the
+# nl_assertions judge at an available model (e.g. TAU2_NL_ASSERTIONS_LLM=openai/gpt-5.4).
+# Default unchanged.
+DEFAULT_LLM_NL_ASSERTIONS = os.environ.get("TAU2_NL_ASSERTIONS_LLM", "gpt-4.1-2025-04-14")
 DEFAULT_LLM_NL_ASSERTIONS_TEMPERATURE = 0.0
 DEFAULT_LLM_NL_ASSERTIONS_ARGS = {"temperature": DEFAULT_LLM_NL_ASSERTIONS_TEMPERATURE}
 

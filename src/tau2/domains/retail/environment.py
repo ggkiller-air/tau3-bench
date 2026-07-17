@@ -18,18 +18,22 @@ def get_environment(
     db: Optional[RetailDB] = None,
     solo_mode: bool = False,
 ) -> Environment:
-    if solo_mode:
-        raise ValueError("Retail domain does not support solo mode")
     if db is None:
         db = RetailDB.load(RETAIL_DB_PATH)
     tools = RetailTools(db)
     with open(RETAIL_POLICY_PATH, "r") as fp:
         policy = fp.read()
-    return Environment(
+    env = Environment(
         domain_name="retail",
         policy=policy,
         tools=tools,
     )
+    # Retail has no separate user tools, so solo mode (agent operates all tools, no
+    # user simulator) is trivially valid — enable it for the schema_solo_std_agent
+    # generalization experiment. Non-solo (interactive) behavior is unchanged.
+    if solo_mode:
+        env.set_solo_mode(True)
+    return env
 
 
 def get_tasks(task_split_name: Optional[str] = "base") -> list[Task]:
