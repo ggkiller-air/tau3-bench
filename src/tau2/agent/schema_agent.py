@@ -40,7 +40,7 @@ from typing import Optional
 
 from loguru import logger
 
-from tau2.agent.llm_agent import LLMAgentState, LLMSoloAgent
+from tau2.agent.llm_agent import LLMAgent, LLMAgentState, LLMSoloAgent
 from tau2.data_model.message import (
     AssistantMessage,
     MultiToolMessage,
@@ -976,4 +976,29 @@ def create_llm_solo_agent_sanitized(tools, domain_policy, **kwargs):
         llm=kwargs.get("llm"),
         llm_args=kwargs.get("llm_args"),
         task=kwargs.get("task"),
+    )
+
+
+class SanitizedLLMAgent(LLMAgent):
+    """LLMAgent (USER mode) + tool-schema sanitization, nothing else.
+
+    Same callability parity as SanitizedLLMSoloAgent, but for the user-simulator
+    setting: the bare ReAct baseline arm against schema_user_agent. Without this,
+    Union[Enum,str] tool params kill qwen tool calls (see note above) and the
+    baseline dies on infrastructure_error instead of on its own merits.
+    """
+
+    def __init__(self, tools, domain_policy, llm, llm_args=None):
+        super().__init__(
+            tools=tools, domain_policy=domain_policy, llm=llm, llm_args=llm_args
+        )
+        self.tools = [_SanitizedTool(t) for t in self.tools]
+
+
+def create_llm_agent_sanitized(tools, domain_policy, **kwargs):
+    return SanitizedLLMAgent(
+        tools=tools,
+        domain_policy=domain_policy,
+        llm=kwargs.get("llm"),
+        llm_args=kwargs.get("llm_args"),
     )

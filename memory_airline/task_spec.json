@@ -1,0 +1,296 @@
+{
+  "__about__": "SchemaFlex AIRLINE dialogue schema (single family). Runs via schema_airline_user_agent (subclass of schema_user_agent). Airline tasks have NO ticket and NO prefix in their id, so _pick_family falls back to next(iter(task_spec)) = this single 'airline' family; intent is elicited at runtime (seeded from the opening narrative, see init_rules). Authored from data/tau2/domains/airline/{policy.md,tools.py,data_model.py}. Current time in-domain = 2024-05-15 15:00:00 EST.",
+  "__coverage__": "v1 solid: IDENTIFY_USER -> GET_RESERVATION -> {cancel, compensation, modify_baggage, refuse, transfer}. book / modify_flights / modify_cabin / modify_passengers route to TRANSFER_HUMAN in v1 (an 8B cannot reliably assemble book_reservation/update_reservation_flights structured payloads in dialogue; a wrong DB write is penalized harder than an honest transfer). Those subtrees are the next iteration.",
+  "__contract__": "All non-identity sequence entries are gated with a 'task_state.resolved == false' prefix so the walk short-circuits once a terminal sets resolved. Disjunctions are written in distributed DNF (no parentheses). Every diagnostic/decision field is typed '...|null' so the MacroInit/seeder leaves it null unless the narrative states it. resolved/escalated init false.",
+  "airline": {
+    "goal_template": "Help <user> with their airline request (cancel / compensation / baggage), following airline policy; confirm before any database write; refuse or transfer when policy does not allow it.",
+    "success_when_all": [
+      "task_state.resolved == true"
+    ],
+    "__domain_config__": "Read by the generic schema_user_agent: identity_field/identity_label/identity_prompt replace the telecom phone-number bootstrap with user_id; agent_prompts override the telecom-worded executor/instruction role prompts with airline ask/confirm wording. Telecom omits these keys and keeps its defaults — one agent, domain text in the schema.",
+    "identity_field": "user_id",
+    "identity_label": "user id (a lowercase handle like 'emma_kim_9957')",
+    "identity_prompt": "I can help with that — to start, could you give me your user id (for example 'emma_kim_9957')?",
+    "agent_prompts": {
+      "executor_system": "You are the EXECUTOR in a schema-driven airline customer-service agent. You are given ONE subtask, the current machine-tracked task_state, and a RESTRICTED set of tools you may call directly. Call EXACTLY ONE tool that advances the current subtask, filling its arguments from task_state and the subtask's rules. Do NOT try to solve the whole request; the loop hands you the next subtask afterwards. Use ONLY values present in task_state or the rules — never invent reservation ids, flight numbers, prices, payment ids, or dates.",
+      "instruct_system": "You are a professional airline customer-service agent talking to a customer. Do EXACTLY the ONE step described below and nothing else: if it asks for information, ask the customer for that ONE item in a short concrete question (their user id, the reservation id, the cancellation reason, the cabin they want); if it is a CONFIRMATION step, state the specific action you are about to take — what will change, and the price to pay or amount to refund if known — then ask them to confirm with a yes, and take no action until they say yes. Use information already in the machine state; never ask for something you were already told. Never invent policies, prices, fees, flights, or refunds. ONE item or ONE confirmation only. One or two sentences. No markdown, no lists, no preamble; end by inviting their reply."
+    },
+    "task_state_schema": {
+      "fields": {
+        "intent": "enum|null (cancel/book/modify_flights/modify_cabin/modify_passengers/modify_baggage/compensation/other); set by the seeder from the opening narrative, or by ASK_INTENT",
+        "user_id": "string|null e.g. 'emma_kim_9957'; stated by the customer (seeded) or asked by IDENTIFY_USER",
+        "user_loaded": "bool|null; set true by IDENTIFY_USER after get_user_details succeeds",
+        "membership": "enum|null (regular/silver/gold); set by IDENTIFY_USER from get_user_details",
+        "reservation_id": "string|null 6-char code e.g. 'EHGLP3'; stated by the customer (seeded), resolved by RESOLVE_RESERVATION, or asked by GET_RESERVATION",
+        "user_reservations": "array|null; the user's reservation id list, copied verbatim from get_user_details 'reservations' by IDENTIFY_USER",
+        "cand_reservations": "array|null; working copy of user_reservations that RESOLVE_RESERVATION consumes head-first while searching for the matching reservation",
+        "trip_origin": "string|null; the origin city/airport the customer mentioned (seeded), used to match the right reservation when the id is unknown",
+        "trip_dest": "string|null; the destination city/airport the customer mentioned (seeded), used to match the right reservation when the id is unknown",
+        "res_loaded": "bool|null; set true by RESOLVE_RESERVATION/GET_RESERVATION after the right reservation's details are loaded",
+        "res_status": "enum|null (active/cancelled); set by GET_RESERVATION (reservation 'status': null->active, 'cancelled'->cancelled)",
+        "res_cabin": "enum|null (basic_economy/economy/business); set by GET_RESERVATION from reservation 'cabin'",
+        "res_insurance": "enum|null (yes/no); set by GET_RESERVATION from reservation 'insurance'",
+        "res_trip_type": "enum|null (one_way/round_trip); set by GET_RESERVATION from reservation 'flight_type'",
+        "res_passenger_count": "int|null; set by GET_RESERVATION = number of entries in reservation 'passengers'",
+        "res_created_recent": "bool|null; set by GET_RESERVATION: true iff reservation 'created_at' is within 24h before 2024-05-15T15:00:00 (i.e. >= 2024-05-14T15:00:00)",
+        "res_any_flown": "bool|null; set by GET_RESERVATION: true iff ANY flight segment has already departed/flown (a flight 'date' strictly before 2024-05-15, or a segment whose status is flying/landed)",
+        "res_payment_id": "string|null; a refund/payment method id in the user profile (gift_card_*/credit_card_*); asked when needed for a paid change",
+        "res_flights": "array|null; the reservation's CURRENT flight segments copied verbatim from get_reservation_details 'flights' as a JSON array of {\"flight_number\":..., \"date\":...} — reused to reassemble the flights argument for any change",
+        "res_origin": "string|null; the reservation's origin IATA, from get_reservation_details 'origin' (used as the search origin for a flight change)",
+        "res_dest": "string|null; the reservation's destination IATA, from get_reservation_details 'destination' (used as the search destination for a flight change)",
+        "new_date": "string|null YYYY-MM-DD; the date the customer wants the changed flight on (set by ASK_FLIGHT_CHANGE), used to search",
+        "search_done": "bool|null; set true by SEARCH_FLIGHTS once a matching flight has been chosen into new_flights",
+        "new_cabin": "enum|null (basic_economy/economy/business); the target cabin for a cabin change (set by ASK_CABIN_CHANGE), or = res_cabin for a flights-only change (set by ASK_FLIGHT_CHANGE)",
+        "new_flights": "array|null; the full new flights JSON array for update_reservation_flights — for a cabin-only change this equals res_flights; for a flight change it is res_flights with the changed segment(s) swapped",
+        "modify_confirmed": "bool|null; set by CONFIRM_MODIFY (true=yes / false=declined)",
+        "modify_done": "bool|null; set by DO_MODIFY_FLIGHTS after update_reservation_flights succeeds",
+        "cancel_reason": "enum|null (change_of_plan/airline_cancelled/health/weather/other); set by ASK_CANCEL_REASON from the customer",
+        "cancel_allowed": "bool|null; set by ASK_CANCEL_REASON per the cancel policy (see its parse_rules)",
+        "cancel_confirmed": "bool|null; set by CONFIRM_CANCEL (true=yes / false=declined)",
+        "cancelled_done": "bool|null; set by DO_CANCEL after cancel_reservation succeeds",
+        "comp_type": "enum|null (cancelled_flight/delayed_flight); set by CHECK_COMPENSATION from the customer's complaint",
+        "comp_eligible": "bool|null; set by CHECK_COMPENSATION per the compensation policy (see its parse_rules)",
+        "comp_amount": "int|null; set by CHECK_COMPENSATION = 100*passengers (cancelled_flight) or 50*passengers (delayed_flight)",
+        "comp_confirmed": "bool|null; set by OFFER_COMPENSATION (true=yes / false=declined)",
+        "comp_done": "bool|null; set by DO_COMPENSATION after send_certificate succeeds",
+        "bag_total": "int|null; set by ASK_BAGGAGE = the new TOTAL number of checked bags the customer wants",
+        "bag_nonfree": "int|null; set by ASK_BAGGAGE = the number of PAID (non-free) bags after the change",
+        "bag_confirmed": "bool|null; set by CONFIRM_BAGGAGE (true=yes / false=declined)",
+        "bag_done": "bool|null; set by DO_BAGGAGE after update_reservation_baggages succeeds",
+        "refused": "bool|null; set by REFUSE_REQUEST when the agent declines an out-of-policy request",
+        "resolved": "bool; the request is complete (a write landed, a refusal was stated, or the customer declined). Set ONLY by terminal subtasks. Init false.",
+        "escalated": "bool; a transfer_to_human_agents call landed. Init false.",
+        "user_payment_ids": "array|null; the user's payment-method ids (gift_card_*/credit_card_*/certificate_*), captured by IDENTIFY_USER from get_user_details 'payment_methods' — the WHITELIST res_payment_id must come from"
+      },
+      "enums": {
+        "intent": [
+          "cancel",
+          "book",
+          "modify_flights",
+          "modify_cabin",
+          "modify_passengers",
+          "modify_baggage",
+          "compensation",
+          "other"
+        ],
+        "membership": [
+          "regular",
+          "silver",
+          "gold"
+        ],
+        "res_status": [
+          "active",
+          "cancelled"
+        ],
+        "res_cabin": [
+          "basic_economy",
+          "economy",
+          "business"
+        ],
+        "res_insurance": [
+          "yes",
+          "no"
+        ],
+        "res_trip_type": [
+          "one_way",
+          "round_trip"
+        ],
+        "cancel_reason": [
+          "change_of_plan",
+          "airline_cancelled",
+          "health",
+          "weather",
+          "other"
+        ],
+        "comp_type": [
+          "cancelled_flight",
+          "delayed_flight"
+        ],
+        "new_cabin": [
+          "basic_economy",
+          "economy",
+          "business"
+        ]
+      }
+    },
+    "init_rules": [
+      "user_id: copy verbatim ONLY if the customer states their user id (a lowercase name_digits handle like 'emma_kim_9957'); else null.",
+      "intent: classify the customer's PRIMARY request from the narrative: 'cancel' = cancel a reservation; 'compensation' = wants a refund/certificate/compensation for a cancelled or delayed flight; 'modify_baggage' = add checked bags; 'book' = book a new trip; 'modify_flights' = change flights/dates; 'modify_cabin' = change cabin class; 'modify_passengers' = change passenger details; else 'other'. If unclear, leave null.",
+      "reservation_id: copy a 6-character alphanumeric booking code verbatim if the customer states one; else null.",
+      "trip_origin / trip_dest: if the customer mentions the cities/airports of the trip (e.g. 'from ATL to PHL', 'SFO to New York'), copy them (city name or IATA code); else null. Used to find the right reservation when they don't know the id.",
+      "cancel_reason: ONLY if they are cancelling and state why — map to change_of_plan / airline_cancelled / health / weather / other; else null.",
+      "Do NOT fabricate reservation details (cabin, insurance, dates, passenger count, prices) or membership from the narrative — those come ONLY from get_reservation_details / get_user_details. Leave them null.",
+      "resolved := false; escalated := false; every other field null."
+    ],
+    "base_subtask_sequence": [
+      {
+        "name": "identifyUser",
+        "subtask_type": "IDENTIFY_USER",
+        "when": "task_state.user_loaded == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "askIntent",
+        "subtask_type": "ASK_INTENT",
+        "when": "task_state.resolved == false and task_state.user_loaded == true and task_state.intent == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "resolveReservation",
+        "subtask_type": "RESOLVE_RESERVATION",
+        "when": "task_state.resolved == false and task_state.user_loaded == true and task_state.intent != null and task_state.intent != 'book' and task_state.res_loaded == null and task_state.reservation_id == null and task_state.user_reservations != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "getReservation",
+        "subtask_type": "GET_RESERVATION",
+        "when": "task_state.resolved == false and task_state.user_loaded == true and task_state.intent != 'book' and task_state.res_loaded == null and task_state.reservation_id != null or task_state.resolved == false and task_state.user_loaded == true and task_state.intent != 'book' and task_state.res_loaded == null and task_state.user_reservations == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "transferFlown",
+        "subtask_type": "TRANSFER_HUMAN",
+        "when": "task_state.resolved == false and task_state.escalated != true and task_state.res_any_flown == true and task_state.intent == 'cancel' or task_state.resolved == false and task_state.escalated != true and task_state.res_any_flown == true and task_state.intent == 'modify_flights' or task_state.resolved == false and task_state.escalated != true and task_state.res_any_flown == true and task_state.intent == 'modify_cabin'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "askCancelReason",
+        "subtask_type": "ASK_CANCEL_REASON",
+        "when": "task_state.resolved == false and task_state.intent == 'cancel' and task_state.res_loaded == true and task_state.res_any_flown == false and task_state.cancel_allowed == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "confirmCancel",
+        "subtask_type": "CONFIRM_CANCEL",
+        "when": "task_state.resolved == false and task_state.intent == 'cancel' and task_state.cancel_allowed == true and task_state.cancel_confirmed == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doCancel",
+        "subtask_type": "DO_CANCEL",
+        "when": "task_state.resolved == false and task_state.intent == 'cancel' and task_state.cancel_confirmed == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "refuseCancel",
+        "subtask_type": "REFUSE_REQUEST",
+        "when": "task_state.resolved == false and task_state.intent == 'cancel' and task_state.cancel_allowed == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "checkCompensation",
+        "subtask_type": "CHECK_COMPENSATION",
+        "when": "task_state.resolved == false and task_state.intent == 'compensation' and task_state.res_loaded == true and task_state.comp_eligible == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "offerCompensation",
+        "subtask_type": "OFFER_COMPENSATION",
+        "when": "task_state.resolved == false and task_state.intent == 'compensation' and task_state.comp_eligible == true and task_state.comp_confirmed == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doCompensation",
+        "subtask_type": "DO_COMPENSATION",
+        "when": "task_state.resolved == false and task_state.intent == 'compensation' and task_state.comp_confirmed == true",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "refuseCompensation",
+        "subtask_type": "REFUSE_REQUEST",
+        "when": "task_state.resolved == false and task_state.intent == 'compensation' and task_state.comp_eligible == false",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "askBaggage",
+        "subtask_type": "ASK_BAGGAGE",
+        "when": "task_state.resolved == false and task_state.intent == 'modify_baggage' and task_state.res_loaded == true and task_state.bag_nonfree == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "confirmBaggage",
+        "subtask_type": "CONFIRM_BAGGAGE",
+        "when": "task_state.resolved == false and task_state.intent == 'modify_baggage' and task_state.bag_nonfree != null and task_state.bag_confirmed == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doBaggage",
+        "subtask_type": "DO_BAGGAGE",
+        "when": "task_state.resolved == false and task_state.intent == 'modify_baggage' and task_state.bag_confirmed == true and task_state.res_payment_id != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "refuseBasicFlight",
+        "subtask_type": "REFUSE_REQUEST",
+        "when": "task_state.resolved == false and task_state.intent == 'modify_flights' and task_state.res_cabin == 'basic_economy'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "askCabinChange",
+        "subtask_type": "ASK_CABIN_CHANGE",
+        "when": "task_state.resolved == false and task_state.intent == 'modify_cabin' and task_state.res_loaded == true and task_state.new_cabin == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "askFlightChange",
+        "subtask_type": "ASK_FLIGHT_CHANGE",
+        "when": "task_state.resolved == false and task_state.intent == 'modify_flights' and task_state.res_cabin != 'basic_economy' and task_state.res_loaded == true and task_state.new_flights == null and task_state.new_date == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "searchFlights",
+        "subtask_type": "SEARCH_FLIGHTS",
+        "when": "task_state.resolved == false and task_state.intent == 'modify_flights' and task_state.new_flights == null and task_state.new_date != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "confirmModify",
+        "subtask_type": "CONFIRM_MODIFY",
+        "when": "task_state.resolved == false and task_state.intent == 'modify_cabin' and task_state.new_flights != null and task_state.modify_confirmed == null or task_state.resolved == false and task_state.intent == 'modify_flights' and task_state.new_flights != null and task_state.modify_confirmed == null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "doModify",
+        "subtask_type": "DO_MODIFY_FLIGHTS",
+        "when": "task_state.resolved == false and task_state.modify_confirmed == true and task_state.res_payment_id != null",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "transferUnsupported",
+        "subtask_type": "TRANSFER_HUMAN",
+        "when": "task_state.resolved == false and task_state.escalated != true and task_state.intent == 'book' or task_state.resolved == false and task_state.escalated != true and task_state.intent == 'modify_passengers'",
+        "expects": [],
+        "produces": []
+      },
+      {
+        "name": "transferOther",
+        "subtask_type": "TRANSFER_HUMAN",
+        "when": "task_state.resolved == false and task_state.escalated != true and task_state.intent == 'other'",
+        "expects": [],
+        "produces": []
+      }
+    ]
+  }
+}

@@ -21,6 +21,7 @@ from tau2.agent.llm_react_agent import (
     create_llm_react_agent,
 )
 from tau2.agent.schema_agent import (
+    create_llm_agent_sanitized,
     create_llm_solo_agent_sanitized,
     create_schema_solo_agent,
 )
@@ -354,6 +355,10 @@ try:
         "llm_agent_solo_sanitized",
         task_filter=LLMSoloAgent.check_valid_task,
         metadata={"solo_mode": True},
+    )
+    registry.register_agent_factory(
+        create_llm_agent_sanitized,
+        "llm_agent_sanitized",
     )
     registry.register_agent_factory(
         create_llm_solo_std_agent,

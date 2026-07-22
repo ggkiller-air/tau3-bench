@@ -4,8 +4,8 @@
 
 ```bash
 bash scripts/start_2gpu_server.sh --list-models        # 看可用模型
-export CUDA_VISIBLE_DEVICES=6,7
-bash scripts/start_2gpu_server.sh --model qwen3-8b  --port 9000   # 起服务 (默认开 prefix caching)
+export CUDA_VISIBLE_DEVICES=4,6
+bash scripts/start_2gpu_server.sh --model qwen3-8b  --port 7000   # 起服务 (默认开 prefix caching)
 ```
 
 ## 2. 跑 SchemaFlex（本地 8B）
