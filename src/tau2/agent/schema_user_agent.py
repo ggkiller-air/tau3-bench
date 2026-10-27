@@ -1676,6 +1676,8 @@ class SchemaUserAgent(SchemaSoloAgent):
                 _gf = self._pred_fields(self._family_spec(state).get("success_when_all", []))
                 _goal_before = {f: state.task_state.get(f) for f in _gf}
                 _sk_done_before = state.subtask_done.get(pend["subtask"], False)
+                # Count only state-value changes as progress, not valid no-op writes.
+                _state_before_update = dict(state.task_state)
                 written = self._update_from_user_reply(
                     pend["subtask_type"], pend["subtask"], pend["tool_name"], text, state
                 )
@@ -1691,8 +1693,11 @@ class SchemaUserAgent(SchemaSoloAgent):
                 sk = pend["subtask"]
                 if state.subtask_done.get(sk):
                     state.stuck.pop(sk, None)
-                elif written:
-                    state.stuck[sk] = 0  # made progress; reset
+                elif any(
+                    _state_before_update.get(field) != state.task_state.get(field)
+                    for field in (written or [])
+                ):
+                    state.stuck[sk] = 0  # a state value actually changed
                 else:
                     state.stuck[sk] = state.stuck.get(sk, 0) + 1  # refused / vague
                 if _WATCHDOG_ON:
