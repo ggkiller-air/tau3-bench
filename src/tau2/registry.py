@@ -37,6 +37,10 @@ from tau2.agent.schema_solo_std_agent import (
     SchemaSoloStdAgent,
     create_schema_solo_std_agent,
 )
+from tau2.agent.scheduler_ablation import (
+    SchedulerAblationAgent,
+    create_scheduler_ablation_agent,
+)
 from tau2.agent.schema_user_agent import (
     SchemaUserAgent,
     create_schema_user_agent,
@@ -369,6 +373,11 @@ try:
     registry.register_agent_factory(
         create_llm_std_flex_agent,
         "llm_agent_std_flex",
+    )
+    registry.register_agent_factory(
+        create_scheduler_ablation_agent,
+        "schema_scheduler_ablation",
+        task_filter=SchedulerAblationAgent.check_valid_task,
     )
     registry.register_agent_factory(
         create_schema_user_agent,

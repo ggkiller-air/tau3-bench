@@ -735,14 +735,14 @@
       {
         "name": "fixStoragePerm",
         "subtask_type": "FIX_STORAGE_PERM",
-        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.speed_test != null and task_state.mms_storage_perm != true",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.speed_test != null and task_state.mms_storage_perm == false",
         "expects": [],
         "produces": []
       },
       {
         "name": "fixSmsPerm",
         "subtask_type": "FIX_SMS_PERM",
-        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.speed_test != null and task_state.mms_sms_perm != true",
+        "when": "task_state.resolved == false and task_state.service_status == 'connected' and task_state.speed_test != null and task_state.mms_sms_perm == false",
         "expects": [],
         "produces": []
       },

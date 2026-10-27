@@ -1370,7 +1370,7 @@
           "app_name": "messaging",
           "permission": "storage"
         },
-        "when": "task_state.mms_storage_perm != true"
+        "when": "task_state.mms_storage_perm == false"
       },
       {
         "tool": "can_send_mms",
@@ -1428,7 +1428,7 @@
           "app_name": "messaging",
           "permission": "sms"
         },
-        "when": "task_state.mms_sms_perm != true"
+        "when": "task_state.mms_sms_perm == false"
       },
       {
         "tool": "can_send_mms",
